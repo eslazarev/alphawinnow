@@ -71,7 +71,7 @@ jobs:
       raise: ${{ steps.decide.outputs.raise }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -150,7 +150,7 @@ jobs:
       ref: ${{ steps.version.outputs.ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The level is derived from the commits since the last `v*` tag.
           fetch-depth: 0
@@ -267,7 +267,7 @@ jobs:
             archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.ref }}
           # This job builds and runs code from a ref resolved at run time. It
@@ -334,7 +334,7 @@ jobs:
           echo "stem=${stem}" >> "$GITHUB_OUTPUT"
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.archive.outputs.stem }}
           path: dist/*
@@ -351,7 +351,7 @@ jobs:
     environment: crates-io
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.ref }}
           # This job builds and runs code from a ref resolved at run time. It
@@ -387,7 +387,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.ref }}
           # This job builds and runs code from a ref resolved at run time. It
@@ -396,7 +396,7 @@ jobs:
           persist-credentials: false
 
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
