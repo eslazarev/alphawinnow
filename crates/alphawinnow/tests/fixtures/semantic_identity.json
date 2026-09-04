@@ -1,0 +1,42 @@
+{
+  "equivalent": [
+    ["close", "multiply(close, 2)"],
+    ["close", "divide(close, 4.0)"],
+    ["close", "multiply(close, 2, 3)"],
+    ["close", "multiply(close, -2, -3)"],
+    ["close", "multiply(multiply(close, 2), 3)"],
+    ["close", "divide(multiply(close, 6), 3)"],
+    ["close", "divide(divide(close, -2), -3)"],
+    ["close", "multiply(divide(close, -2), -3)"],
+    ["close", "add(close, close)"],
+    ["close", "add(add(close, close), close)"],
+    ["add(close, open)", "add(add(close, open), add(close, open))"],
+    ["multiply(close, -2)", "multiply(close, -7)"],
+    ["add(close, open)", "add(open, close)"],
+    ["multiply(close, open)", "multiply(open, 2, close)"],
+    ["clip(close, lower=-2, upper=2)", "clip(close, upper=2.0, lower=-2.0)"],
+    ["winsorize(close, std=2)", "winsorize(close, std=2.0)"]
+  ],
+  "distinct": [
+    ["close", "multiply(close, -2)"],
+    ["close", "multiply(close, -2, 3)"],
+    ["rank(close)", "rank(multiply(close, 2))"],
+    ["clip(close, lower=-2, upper=2)", "clip(multiply(close, 2), lower=-2, upper=2)"],
+    ["winsorize(close, std=2)", "winsorize(multiply(close, 2), std=2)"],
+    ["if_else(greater(close, 0), close, open)", "if_else(greater(multiply(close, 2), 0), close, open)"],
+    ["add(rank(close), rank(open))", "add(multiply(rank(close), 2), rank(open))"],
+    ["add(close, open)", "add(multiply(close, 2), open)"],
+    ["group_rank(close, group(\"sector\"))", "group_rank(close, group(\"country\"))"]
+  ],
+  "rejected": [
+    {"expression": "subtract(close, close)", "reason": "provably_zero"},
+    {"expression": "subtract(add(close, open), add(open, close))", "reason": "provably_zero"},
+    {"expression": "multiply(close, 0)", "reason": "provably_zero"},
+    {"expression": "multiply(multiply(close, -2), 0, -3)", "reason": "provably_zero"},
+    {"expression": "add(subtract(close, close), subtract(open, open))", "reason": "provably_zero"},
+    {"expression": "ts_mean(subtract(close, close), 5)", "reason": "provably_zero"},
+    {"expression": "rank(multiply(close, 0))", "reason": "provably_constant"},
+    {"expression": "group_rank(subtract(close, close), group(\"sector\"))", "reason": "provably_constant"},
+    {"expression": "clip(subtract(close, close), lower=1, upper=2)", "reason": "provably_constant"}
+  ]
+}

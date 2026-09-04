@@ -1,0 +1,98 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One Pages deployment at a time, and never cancel one midway: a cancelled
+# deployment can leave the site serving a half-uploaded artifact.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build rustdoc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `configure-pages` needs this to turn the Pages site on for the first
+      # deployment, so the repository needs no manual settings change.
+      pages: write
+    env:
+      # The same gate the CI `docs` job applies, so a broken intra-doc link
+      # fails the build instead of being published.
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable and configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the API reference
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Prepare the Pages root
+        run: |
+          set -euo pipefail
+          # rustdoc writes its entry point one level down; Pages serves the
+          # directory root, so send visitors there.
+          cat > target/doc/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <meta charset="utf-8">
+          <title>AlphaWinnow API documentation</title>
+          <meta http-equiv="refresh" content="0; url=alphawinnow/index.html">
+          <link rel="canonical" href="alphawinnow/index.html">
+          <p>Redirecting to the
+          <a href="alphawinnow/index.html">AlphaWinnow API documentation</a>.</p>
+          </html>
+          HTML
+          # Serve the artifact verbatim rather than through Jekyll.
+          touch target/doc/.nojekyll
+          # Cargo's build lock is not part of the site.
+          rm -f target/doc/.lock
+          echo "Publishing $(find target/doc -name '*.html' | wc -l) HTML pages"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
