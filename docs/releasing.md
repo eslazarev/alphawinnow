@@ -58,7 +58,10 @@ artifact must not consume one. The run stops before raising anything when:
 ### Overriding the level, or releasing by hand
 
 Run the workflow from the Actions tab with **Run workflow**, uncheck `dry_run`,
-and pick `level` explicitly to force `patch`, `minor`, or `major`.
+and pick `level` explicitly to force `patch`, `minor`, or `major`. Manual runs
+always release the repository's default branch; the ref selector shown by the
+Actions UI is deliberately ignored so it cannot inject an unreviewed branch
+into the default branch's cache scope.
 
 A tag pushed by hand still releases exactly that tag and raises nothing:
 
@@ -86,20 +89,27 @@ anything is built or uploaded.
    `chore(release): vX.Y.Z`, and push the commit and the tag. The order is the
    point: every check is read-only, so a failure can never leave a tag behind
    on a commit that does not build. The raise step is skipped for a pushed tag,
-   which already names its version. Every later job checks out that tag rather
-   than the commit that started the run, so the release is built from exactly
-   the tree the tag points at.
+   which already names its version. Every later job checks out the immutable
+   commit SHA verified by this job, so the release cannot move to another tree
+   between verification and packaging.
 4. **binaries** — builds `alphawinnow` with `--all-features` for
    `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
    `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
    `x86_64-pc-windows-msvc`. Each archive carries the README, the licence, and
    a SHA-256 checksum, and every natively runnable binary answers
-   `--version` and `doctor --json` before it is packaged.
+   `--version` and `doctor --json` before it is packaged. The two Linux jobs
+   additionally produce a `.deb` and an `.rpm` from that same unstripped
+   binary, each on its own architecture so that `dpkg-shlibdeps` and `ldd`
+   resolve real dependencies.
 5. **crates-io** — publishes with `cargo publish --workspace --locked`. One
    crate carries both targets, so there is no multi-crate ordering to get
    wrong and no window in which a half-published release is visible.
 6. **github-release** — creates the release for the tag and attaches every
-   archive and checksum.
+   archive, package, and checksum.
+7. **packaging** — regenerates `Formula/alphawinnow.rb` and the Scoop manifest
+   from the published checksums and commits them to the default branch, which
+   is what `brew tap` and Scoop read. It runs last because those manifests
+   point at release download URLs that do not exist until the release does.
 
 The jobs are chained so that each irreversible step happens only after the
 previous one succeeded. The publish job waits for the whole binary matrix, so a
@@ -112,10 +122,10 @@ install.
 
 Run the workflow manually from the Actions tab with **Run workflow** and leave
 `dry_run` checked. That path raises no version and writes no tag: it runs
-`verify` and the full binary matrix against the branch as it stands, uploads
-the archives as workflow artifacts, and skips both crates.io and the GitHub
-Release. It is the cheapest way to confirm that a new target or a dependency
-bump still builds everywhere.
+`verify` and the full binary matrix against the default branch as it stands,
+uploads the archives as workflow artifacts, and skips both crates.io and the
+GitHub Release. It is the cheapest way to confirm that a new target or a
+dependency bump still builds everywhere.
 
 ## If a release goes wrong
 

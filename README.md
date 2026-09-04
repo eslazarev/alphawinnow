@@ -62,17 +62,65 @@ pipelines. Typical workflows include:
 - creating reproducible JSONL datasets for symbolic regression or ML research;
 - benchmarking parallel quantitative-expression search in Rust.
 
-## Quick start
+## Install
 
-Rust 1.92 or newer is required.
+Every prebuilt channel below serves the same platform binaries that
+[`release.yml`](.github/workflows/release.yml) built. A source installation
+instead compiles the same version from its locked dependencies.
 
-Install the CLI from crates.io:
+**Homebrew** (macOS and Linux, Apple silicon and x86-64):
+
+```bash
+brew tap eslazarev/alphawinnow https://github.com/eslazarev/alphawinnow
+brew install alphawinnow
+```
+
+**Scoop** (Windows):
+
+```powershell
+scoop install https://raw.githubusercontent.com/eslazarev/alphawinnow/main/packaging/scoop/alphawinnow.json
+```
+
+**Debian, Ubuntu, Fedora, RHEL** — download the package for your architecture
+from the [latest release](https://github.com/eslazarev/alphawinnow/releases/latest)
+and install it:
+
+```bash
+sudo dpkg -i alphawinnow_<version>-1_amd64.deb     # or _arm64.deb
+sudo rpm -i alphawinnow-<version>-1.x86_64.rpm     # or .aarch64.rpm
+```
+
+**Prebuilt binary through Cargo**, without compiling:
+
+```bash
+cargo binstall alphawinnow
+```
+
+**From source**, which needs Rust 1.92 or newer:
 
 ```bash
 cargo install alphawinnow --locked
 ```
 
-Or build it from a checkout:
+Or download an archive for your platform straight from the
+[latest release](https://github.com/eslazarev/alphawinnow/releases/latest).
+Each one carries its own `.sha256`, the README, and the licence.
+
+The `.deb` and `.rpm` are built from the very binary the tarball ships, not from
+a separate compilation, and they are not stripped. Each release archive and
+native package has its own SHA-256 checksum because the surrounding package
+formats have different bytes.
+
+The explicit tap URL is needed because this repository is not named
+`homebrew-alphawinnow`; the formula lives in [`Formula/`](Formula) and is
+regenerated from the release archives by
+[`scripts/update-packaging.sh`](scripts/update-packaging.sh), never by hand.
+
+## Quick start
+
+Rust 1.92 or newer is required to build from source.
+
+Build it from a checkout:
 
 ```bash
 git clone https://github.com/eslazarev/alphawinnow.git

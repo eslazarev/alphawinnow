@@ -7,13 +7,25 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # Compatible updates travel together. Major bumps are deliberately left
+      # out of every group so each one arrives as its own pull request: for
+      # this crate an `rand` or `sha2` major can change generated sequences and
+      # digests, which moves candidate identity, the golden fixtures, and the
+      # published benchmark checksum. That review does not belong buried in a
+      # batch of routine upgrades.
       arrow-parquet:
         patterns:
           - arrow-*
           - parquet
+        update-types:
+          - minor
+          - patch
       rust-dependencies:
         patterns:
           - '*'
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: cargo
     directory: /tools/radiate-selection-benchmark
@@ -25,6 +37,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The ref of this action *is* the Rust toolchain it installs, not a
+      # release of the action. Dependabot reads `1.92.0` as a version and
+      # proposes a Rust release that does not exist, which breaks the MSRV job.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       github-actions:
         patterns:
