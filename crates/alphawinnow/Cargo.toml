@@ -1,0 +1,55 @@
+[package]
+name = "alphawinnow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Typed, deterministic formulaic alpha-mining, factor-evaluation, and quantitative expression-search engine with a local CLI"
+documentation = "https://docs.rs/alphawinnow"
+readme = "../../README.md"
+keywords = ["quant-finance", "alpha-mining", "factor-mining", "genetic-programming", "symbolic-regression"]
+categories = ["algorithms", "command-line-utilities", "science"]
+
+[features]
+default = ["cli"]
+# The `alphawinnow` binary. Library-only consumers should depend on this crate
+# with `default-features = false` so that no argument parser is pulled in.
+cli = ["dep:anyhow", "dep:clap", "dep:tempfile"]
+numeric-evidence = []
+parquet-input = ["numeric-evidence", "dep:arrow-array", "dep:chrono", "dep:parquet"]
+
+[lib]
+name = "alphawinnow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alphawinnow"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+rayon.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

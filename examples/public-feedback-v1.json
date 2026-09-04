@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "dataset_id": "public-synthetic-complexity-feedback-v1",
+  "context_checksum": "synthetic-context-no-market-data",
+  "outcome_label": "bounded synthetic utility",
+  "feature_scales": {
+    "depth": 10.0,
+    "nodes": 40.0
+  },
+  "records": [
+    {
+      "record_id": "simple-a",
+      "features": {"depth": 1.0, "nodes": 1.0},
+      "outcome": -0.9,
+      "confidence": 1.0
+    },
+    {
+      "record_id": "simple-b",
+      "features": {"depth": 1.0, "nodes": 2.0},
+      "outcome": -0.8,
+      "confidence": 1.0
+    },
+    {
+      "record_id": "simple-c",
+      "features": {"depth": 2.0, "nodes": 2.0},
+      "outcome": -0.7,
+      "confidence": 1.0
+    },
+    {
+      "record_id": "richer-a",
+      "features": {"depth": 4.0, "nodes": 7.0},
+      "outcome": 0.7,
+      "confidence": 1.0
+    },
+    {
+      "record_id": "richer-b",
+      "features": {"depth": 4.0, "nodes": 8.0},
+      "outcome": 0.8,
+      "confidence": 1.0
+    },
+    {
+      "record_id": "richer-c",
+      "features": {"depth": 5.0, "nodes": 9.0},
+      "outcome": 0.9,
+      "confidence": 1.0
+    }
+  ]
+}
