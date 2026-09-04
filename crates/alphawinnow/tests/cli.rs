@@ -646,7 +646,7 @@ fn audit_feedback_reports_leave_one_out_coverage() {
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["records"], 6);
     assert!(payload["coverage"].as_f64().unwrap() > 0.0);
-    assert!(payload["feedback_checksum"].as_str().unwrap().len() == 64);
+    assert_eq!(payload["feedback_checksum"].as_str().unwrap().len(), 64);
 }
 
 #[cfg(feature = "numeric-evidence")]
