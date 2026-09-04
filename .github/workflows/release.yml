@@ -333,6 +333,31 @@ jobs:
           done
           echo "stem=${stem}" >> "$GITHUB_OUTPUT"
 
+      # Native packages for the two Linux targets. Each is produced on its own
+      # architecture so that dpkg-shlibdeps and ldd resolve real dependencies,
+      # and both reuse the binary the previous steps already built, so the
+      # .deb, the .rpm and the tarball ship byte-identical executables.
+      - name: Install the Linux packaging tools
+        if: contains(matrix.target, 'linux')
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: Build the .deb and the .rpm
+        if: contains(matrix.target, 'linux')
+        run: |
+          set -euo pipefail
+          # --no-strip keeps the packaged executable byte-identical to the one
+          # in the tarball, so a user can check either against the published
+          # SHA-256. Stripping here would save little and would only be correct
+          # alongside a companion debug-symbol package, which this project does
+          # not produce.
+          cargo deb --no-build --no-strip --target "${{ matrix.target }}" -p alphawinnow --output dist/
+          cargo generate-rpm --target "${{ matrix.target }}" -p crates/alphawinnow --output dist/
+          cd dist
+          for package in *.deb *.rpm; do
+            sha256sum "${package}" > "${package}.sha256"
+          done
+          ls -la
+
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
@@ -427,3 +452,54 @@ jobs:
             --verify-tag \
             --notes-file release-notes.md \
             dist/*
+
+  packaging:
+    name: Update package manifests
+    needs:
+      - verify
+      - binaries
+      - github-release
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@v4
+        with:
+          # The manifests are committed to the branch, not to the tag: `brew
+          # tap` and Scoop both read whatever the default branch holds.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Regenerate the manifests
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: bash scripts/update-packaging.sh "${VERSION}" dist
+
+      - name: Commit them if they moved
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula packaging; then
+            echo "Manifests already describe v${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula packaging
+          git commit -m "chore(release): point package manifests at v${VERSION}"
+
+          # The release commit landed on this branch minutes ago and a human
+          # merge may have followed it. Rebase once rather than forcing.
+          git pull --rebase --autostash origin "${DEFAULT_BRANCH}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+          echo "Package manifests now point at v${VERSION}." >> "$GITHUB_STEP_SUMMARY"

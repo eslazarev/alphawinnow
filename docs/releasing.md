@@ -94,12 +94,19 @@ anything is built or uploaded.
    `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
    `x86_64-pc-windows-msvc`. Each archive carries the README, the licence, and
    a SHA-256 checksum, and every natively runnable binary answers
-   `--version` and `doctor --json` before it is packaged.
+   `--version` and `doctor --json` before it is packaged. The two Linux jobs
+   additionally produce a `.deb` and an `.rpm` from that same unstripped
+   binary, each on its own architecture so that `dpkg-shlibdeps` and `ldd`
+   resolve real dependencies.
 5. **crates-io** — publishes with `cargo publish --workspace --locked`. One
    crate carries both targets, so there is no multi-crate ordering to get
    wrong and no window in which a half-published release is visible.
 6. **github-release** — creates the release for the tag and attaches every
-   archive and checksum.
+   archive, package, and checksum.
+7. **packaging** — regenerates `Formula/alphawinnow.rb` and the Scoop manifest
+   from the published checksums and commits them to the default branch, which
+   is what `brew tap` and Scoop read. It runs last because those manifests
+   point at release download URLs that do not exist until the release does.
 
 The jobs are chained so that each irreversible step happens only after the
 previous one succeeded. The publish job waits for the whole binary matrix, so a

@@ -27,7 +27,10 @@ jobs:
           persist-credentials: false
 
       - name: Run analysis
-        uses: ossf/scorecard-action@v2.4.0
+        # v2.4.4 is the first release that pulls its image from ghcr.io.
+        # Earlier tags point at gcr.io/openssf, which now refuses anonymous
+        # pulls, so they fail before the analysis starts.
+        uses: ossf/scorecard-action@v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif

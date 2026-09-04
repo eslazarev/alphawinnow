@@ -48,6 +48,46 @@ tempfile = { workspace = true, optional = true }
 tempfile.workspace = true
 proptest.workspace = true
 
+# `cargo binstall alphawinnow` fetches the release archive built by
+# .github/workflows/release.yml instead of compiling from source. The defaults
+# do not match our asset names, so spell the layout out.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+# Native Linux packages, built by .github/workflows/release.yml from the same
+# binary the tarball ships. `target/release/` is rewritten to the per-target
+# directory when the tools are invoked with `--target`.
+[package.metadata.deb]
+maintainer = "Evgenii Lazarev <elazarev@gmail.com>"
+copyright = "2026, Evgenii Lazarev"
+license-file = ["LICENSE", "0"]
+section = "science"
+priority = "optional"
+extended-description = """\
+AlphaWinnow searches a bounded space of typed quantitative expressions, removes \
+equivalent and trivial signals, and writes a reproducible shortlist. It runs \
+locally and performs no network requests."""
+assets = [
+    ["target/release/alphawinnow", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/alphawinnow/README.md", "644"],
+    ["LICENSE", "usr/share/doc/alphawinnow/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Typed, deterministic formulaic alpha-mining and factor-evaluation engine"
+license = "MIT"
+assets = [
+    { source = "target/release/alphawinnow", dest = "/usr/bin/alphawinnow", mode = "755" },
+    { source = "../../README.md", dest = "/usr/share/doc/alphawinnow/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/alphawinnow/LICENSE", mode = "644", doc = true },
+]
+
 [package.metadata.docs.rs]
 all-features = true
 
