@@ -270,6 +270,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.verify.outputs.ref }}
+          # This job builds and runs code from a ref resolved at run time. It
+          # needs no git write access, so do not leave a usable token in the
+          # checkout for that code to find.
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -350,6 +354,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.verify.outputs.ref }}
+          # This job builds and runs code from a ref resolved at run time. It
+          # needs no git write access, so do not leave a usable token in the
+          # checkout for that code to find.
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -382,6 +390,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.verify.outputs.ref }}
+          # This job builds and runs code from a ref resolved at run time. It
+          # needs no git write access, so do not leave a usable token in the
+          # checkout for that code to find.
+          persist-credentials: false
 
       - name: Download archives
         uses: actions/download-artifact@v4

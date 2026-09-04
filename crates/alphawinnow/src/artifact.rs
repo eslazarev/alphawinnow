@@ -292,6 +292,29 @@ pub fn publication_pointer_path(output: &Path) -> PathBuf {
     output.with_file_name(adjacent)
 }
 
+/// Flush a directory entry so a completed rename survives a crash.
+///
+/// Opening a directory as a file to flush it is a Unix idiom. Windows rejects
+/// that open with `ERROR_ACCESS_DENIED` unless the handle carries backup
+/// semantics, and NTFS journals the metadata operation regardless, so there is
+/// nothing to flush by hand there. Keeping the call strict on Unix preserves
+/// the durability the publication protocol documents without failing a
+/// publication that actually succeeded on other platforms.
+// Off Unix the body has nothing that can fail, so the `Result` looks
+// redundant there; it is the signature that keeps the Unix caller strict.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Durably publish an immutable candidate/manifest pair, then atomically move
 /// one pointer to the complete version. Compatibility aliases are refreshed
 /// only after the authoritative pair is durable.
@@ -354,9 +377,9 @@ pub fn write_run_transactional(
         let result = (|| -> Result<(), std::io::Error> {
             write_new_file(&staging.join("candidates.jsonl"), &candidate_bytes)?;
             write_new_file(&staging.join("manifest.json"), &manifest_bytes)?;
-            File::open(&staging)?.sync_all()?;
+            sync_directory(&staging)?;
             fs::rename(&staging, &final_directory)?;
-            File::open(&runs)?.sync_all()?;
+            sync_directory(&runs)?;
             Ok(())
         })();
         if let Err(source) = result {
@@ -485,9 +508,7 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ArtifactEr
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
-        if let Ok(directory) = File::open(parent) {
-            let _ = directory.sync_all();
-        }
+        let _ = sync_directory(parent);
         Ok(())
     })();
     if let Err(source) = result {
