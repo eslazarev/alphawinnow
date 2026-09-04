@@ -44,8 +44,7 @@ jobs:
     # A rehearsal needs no credentials; every other path ends in an upload, so
     # confirm the token exists before anything is written to the repository.
     if: >-
-      github.ref_type == 'tag'
-      || github.event_name == 'push'
+      github.event_name == 'push'
       || inputs.dry_run == false
     runs-on: ubuntu-latest
     environment: crates-io
@@ -70,9 +69,21 @@ jobs:
       # Whether it should raise the version, or release a version it was given.
       raise: ${{ steps.decide.outputs.raise }}
     steps:
-      - name: Checkout
+      - name: Checkout the pushed ref
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+
+      # A manual run can otherwise select an arbitrary branch while retaining
+      # the default branch's cache-write scope. Never execute that selected
+      # branch: rehearsals and manual releases always start from reviewed code
+      # on the repository's default branch.
+      - name: Checkout the default branch for a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: main
           fetch-depth: 0
 
       - name: Classify this run
@@ -93,15 +104,15 @@ jobs:
             exit 0
           }
 
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            emit true false "Releasing the pushed tag ${GITHUB_REF_NAME}; no version is raised."
-          fi
-
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             if [ "${DRY_RUN}" = "false" ]; then
               emit true true "Manual publish requested."
             fi
             emit true false "Rehearsal only; nothing is raised or published."
+          fi
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            emit true false "Releasing the pushed tag ${GITHUB_REF_NAME}; no version is raised."
           fi
 
           # Belt and braces. A push made with GITHUB_TOKEN does not start a new
@@ -147,12 +158,22 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.version.outputs.publish }}
-      ref: ${{ steps.version.outputs.ref }}
+      revision: ${{ steps.version.outputs.revision }}
     steps:
-      - name: Checkout
+      - name: Checkout the pushed ref
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
           # The level is derived from the commits since the last `v*` tag.
+          fetch-depth: 0
+
+      - name: Checkout the default branch for a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          # workflow_dispatch lets its caller select a ref. Releases may only
+          # execute reviewed code from the default branch.
+          ref: main
           fetch-depth: 0
 
       - name: Set up Rust
@@ -197,7 +218,11 @@ jobs:
           git tag -a "v${version}" -m "v${version}"
           # A plain push, so a branch that moved under us fails loudly instead
           # of overwriting someone else's commit.
-          git push origin HEAD:"${GITHUB_REF_NAME}"
+          release_branch="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            release_branch=main
+          fi
+          git push origin HEAD:"${release_branch}"
           git push origin "v${version}"
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -219,26 +244,28 @@ jobs:
               exit 1
             fi
             version="${RAISED_VERSION}"
-            ref="refs/tags/v${version}"
             publish=true
-          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
             if [ "${version}" != "${manifest_version}" ]; then
               echo "::error title=Version mismatch::tag ${GITHUB_REF_NAME} does not match workspace version ${manifest_version}"
               exit 1
             fi
-            ref="${GITHUB_REF}"
             publish=true
           else
             version="${manifest_version}"
-            ref="${GITHUB_REF}"
             publish=false
           fi
+
+          # Downstream jobs checkout the exact tree verified above. In
+          # particular, never pass a mutable or caller-selected ref across the
+          # workflow boundary.
+          revision="$(git rev-parse HEAD)"
 
           {
             echo "version=${version}"
             echo "publish=${publish}"
-            echo "ref=${ref}"
+            echo "revision=${revision}"
           } >> "$GITHUB_OUTPUT"
           echo "Releasing v${version}; publishing to crates.io: ${publish}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -269,10 +296,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.verify.outputs.ref }}
-          # This job builds and runs code from a ref resolved at run time. It
-          # needs no git write access, so do not leave a usable token in the
-          # checkout for that code to find.
+          ref: ${{ needs.verify.outputs.revision }}
+          # This job builds and runs the exact commit verified above. It needs
+          # no git write access, so do not leave a usable token in the checkout
+          # for that code to find.
           persist-credentials: false
 
       - name: Set up Rust
@@ -280,11 +307,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Deliberately uncached. These jobs check out a ref resolved at run time
-      # and then execute build scripts from it, so writing to a cache the
-      # default branch later restores would be a supply-chain path into the
-      # artifacts we publish and checksum. Release builds are rare; a cold
-      # build is the cheaper side of that trade.
+      # Deliberately uncached. These jobs execute build scripts from the
+      # verified commit, so writing their results to a cache that another
+      # workflow restores would needlessly widen the release trust boundary.
+      # Release builds are rare; a cold build is the cheaper side of that
+      # trade.
       - name: Build release binary
         run: >
           cargo build --release --locked --all-features
@@ -346,10 +373,9 @@ jobs:
         run: |
           set -euo pipefail
           # --no-strip keeps the packaged executable byte-identical to the one
-          # in the tarball, so a user can check either against the published
-          # SHA-256. Stripping here would save little and would only be correct
-          # alongside a companion debug-symbol package, which this project does
-          # not produce.
+          # in the tarball. Stripping here would save little and would only be
+          # correct alongside a companion debug-symbol package, which this
+          # project does not produce.
           cargo deb --no-build --no-strip --target "${{ matrix.target }}" -p alphawinnow --output dist/
           cargo generate-rpm --target "${{ matrix.target }}" -p crates/alphawinnow --output dist/
           cd dist
@@ -378,10 +404,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.verify.outputs.ref }}
-          # This job builds and runs code from a ref resolved at run time. It
-          # needs no git write access, so do not leave a usable token in the
-          # checkout for that code to find.
+          ref: ${{ needs.verify.outputs.revision }}
+          # This job builds and runs the exact commit verified above. It needs
+          # no git write access, so do not leave a usable token in the checkout
+          # for that code to find.
           persist-credentials: false
 
       - name: Set up Rust
@@ -414,10 +440,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.verify.outputs.ref }}
-          # This job builds and runs code from a ref resolved at run time. It
-          # needs no git write access, so do not leave a usable token in the
-          # checkout for that code to find.
+          ref: ${{ needs.verify.outputs.revision }}
+          # This job builds and runs the exact commit verified above. It needs
+          # no git write access, so do not leave a usable token in the checkout
+          # for that code to find.
           persist-credentials: false
 
       - name: Download archives

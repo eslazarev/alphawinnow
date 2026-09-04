@@ -58,7 +58,10 @@ artifact must not consume one. The run stops before raising anything when:
 ### Overriding the level, or releasing by hand
 
 Run the workflow from the Actions tab with **Run workflow**, uncheck `dry_run`,
-and pick `level` explicitly to force `patch`, `minor`, or `major`.
+and pick `level` explicitly to force `patch`, `minor`, or `major`. Manual runs
+always release the repository's default branch; the ref selector shown by the
+Actions UI is deliberately ignored so it cannot inject an unreviewed branch
+into the default branch's cache scope.
 
 A tag pushed by hand still releases exactly that tag and raises nothing:
 
@@ -86,9 +89,9 @@ anything is built or uploaded.
    `chore(release): vX.Y.Z`, and push the commit and the tag. The order is the
    point: every check is read-only, so a failure can never leave a tag behind
    on a commit that does not build. The raise step is skipped for a pushed tag,
-   which already names its version. Every later job checks out that tag rather
-   than the commit that started the run, so the release is built from exactly
-   the tree the tag points at.
+   which already names its version. Every later job checks out the immutable
+   commit SHA verified by this job, so the release cannot move to another tree
+   between verification and packaging.
 4. **binaries** — builds `alphawinnow` with `--all-features` for
    `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
    `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
@@ -119,10 +122,10 @@ install.
 
 Run the workflow manually from the Actions tab with **Run workflow** and leave
 `dry_run` checked. That path raises no version and writes no tag: it runs
-`verify` and the full binary matrix against the branch as it stands, uploads
-the archives as workflow artifacts, and skips both crates.io and the GitHub
-Release. It is the cheapest way to confirm that a new target or a dependency
-bump still builds everywhere.
+`verify` and the full binary matrix against the default branch as it stands,
+uploads the archives as workflow artifacts, and skips both crates.io and the
+GitHub Release. It is the cheapest way to confirm that a new target or a
+dependency bump still builds everywhere.
 
 ## If a release goes wrong
 
