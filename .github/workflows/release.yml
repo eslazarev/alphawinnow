@@ -71,7 +71,7 @@ jobs:
     steps:
       - name: Checkout the pushed ref
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -81,7 +81,7 @@ jobs:
       # on the repository's default branch.
       - name: Checkout the default branch for a manual run
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -162,14 +162,14 @@ jobs:
     steps:
       - name: Checkout the pushed ref
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The level is derived from the commits since the last `v*` tag.
           fetch-depth: 0
 
       - name: Checkout the default branch for a manual run
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # workflow_dispatch lets its caller select a ref. Releases may only
           # execute reviewed code from the default branch.
@@ -294,7 +294,7 @@ jobs:
             archive: zip
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.revision }}
           # This job builds and runs the exact commit verified above. It needs
@@ -385,7 +385,7 @@ jobs:
           ls -la
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.archive.outputs.stem }}
           path: dist/*
@@ -402,7 +402,7 @@ jobs:
     environment: crates-io
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.revision }}
           # This job builds and runs the exact commit verified above. It needs
@@ -438,7 +438,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.revision }}
           # This job builds and runs the exact commit verified above. It needs
@@ -447,7 +447,7 @@ jobs:
           persist-credentials: false
 
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -491,14 +491,14 @@ jobs:
       contents: write
     steps:
       - name: Checkout the default branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The manifests are committed to the branch, not to the tag: `brew
           # tap` and Scoop both read whatever the default branch holds.
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Download the release archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

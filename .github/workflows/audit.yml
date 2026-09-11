@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Audit the workspace lockfile
         uses: rustsec/audit-check@v2
@@ -41,7 +41,7 @@ jobs:
           - bans licenses sources
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check ${{ matrix.checks }}
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -54,7 +54,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
