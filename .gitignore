@@ -6,6 +6,15 @@
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
+__pycache__/
+*.pyc
 .DS_Store
 .idea/
 .vscode/
+/benchmarks/results/
+/benchmarks/data/
+/benchmarks/logs/
+# Local research workspaces are not part of the public library release.
+# Keep their files on disk; publish selected synthetic fixtures separately.
+/alphagen-rs/
+/benchmarks/

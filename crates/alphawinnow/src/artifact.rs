@@ -15,7 +15,7 @@ use crate::{
 };
 
 pub const CANDIDATE_SCHEMA: u32 = 4;
-pub const MANIFEST_SCHEMA: u32 = 6;
+pub const MANIFEST_SCHEMA: u32 = 8;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Portable candidate record. The score contains no market-performance evidence.
@@ -52,6 +52,29 @@ pub struct StructuralScoreComponents {
     pub transform_diversity: f64,
 }
 
+/// Identity of immutable measured feedback used to guide a search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackProvenance {
+    pub dataset_id: String,
+    pub context_checksum: String,
+    pub feedback_checksum: String,
+    pub configuration_checksum: String,
+    pub outcome_label: String,
+}
+
+/// Identity and exact weights of an opt-in feedback-derived operator policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorPolicyProvenance {
+    pub configuration_checksum: String,
+    pub base_catalog_checksum: String,
+    pub adjusted_catalog_checksum: String,
+    pub generation_weights: std::collections::BTreeMap<String, u16>,
+    pub transform_action_weights: std::collections::BTreeMap<String, u16>,
+    pub transform_action_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_action_archive_checksum: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub schema: u32,
@@ -61,6 +84,20 @@ pub struct RunManifest {
     pub tool_version: String,
     pub search_spec: SearchSpec,
     pub config_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_feedback: Option<FeedbackProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_policy: Option<OperatorPolicyProvenance>,
+    #[serde(default)]
+    pub guided_population_candidates: u64,
+    #[serde(default)]
+    pub seeded_from_archive: bool,
+    #[serde(default)]
+    pub frozen_seed_parents: bool,
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub feedback_elite_parent_count: usize,
+    #[serde(default)]
+    pub catalog_scaffold_policy: crate::CatalogScaffoldPolicy,
     pub archive_records: u64,
     pub archive_accepted_records: u64,
     pub archive_duplicate_records: u64,
@@ -89,7 +126,12 @@ pub struct RunManifest {
     pub candidate_content_checksum: String,
 }
 
-pub const CHECKPOINT_SCHEMA: u32 = 1;
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+pub const CHECKPOINT_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointDraft {
@@ -105,6 +147,8 @@ pub struct RunCheckpoint {
     pub run_id: String,
     pub config_checksum: String,
     pub operator_catalog_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_feedback: Option<FeedbackProvenance>,
     pub next_generation: u64,
     pub generations_completed: u64,
     pub attempted_candidates: u64,

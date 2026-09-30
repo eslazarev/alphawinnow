@@ -4,7 +4,7 @@
 //! only exists when that feature is active.
 #![cfg(feature = "cli")]
 
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 
@@ -29,6 +29,26 @@ fn candidate_line(expression: &str) -> String {
         }
     })
     .to_string()
+}
+
+fn write_action_archive(path: &Path) {
+    let output = command()
+        .args([
+            "search",
+            "--output",
+            path.to_str().unwrap(),
+            "--duration-seconds",
+            "10",
+            "--max-candidates",
+            "100",
+            "--shortlist-size",
+            "20",
+            "--seed",
+            "17",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
 }
 
 #[test]
@@ -72,6 +92,40 @@ fn inspect_flags_provably_zero_with_a_machine_readable_reason() {
     assert!(output.status.success());
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rejection_reason"], "provably_zero");
+}
+
+#[test]
+fn inspect_uses_and_records_an_explicit_catalog() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.json");
+    let builtin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("catalog/public-v1.json");
+    let mut catalog: alphawinnow::Catalog =
+        serde_json::from_slice(&fs::read(builtin).unwrap()).unwrap();
+    catalog.fields.push(alphawinnow::FieldSpec {
+        name: "vwap".to_owned(),
+        kind: alphawinnow::ExprKind::Signal,
+        family: "price".to_owned(),
+        allowed_roles: vec!["signal_input".to_owned()],
+    });
+    fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+
+    let output = command()
+        .args([
+            "inspect",
+            "--catalog",
+            catalog_path.to_str().unwrap(),
+            "multiply(vwap, close)",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["operator_catalog_checksum"], catalog.checksum());
+    assert_eq!(payload["canonical"], "multiply(close, vwap)");
 }
 
 #[test]
@@ -175,7 +229,7 @@ fn search_writes_candidate_jsonl_and_adjacent_manifest_atomically() {
     let manifest_path = directory.path().join("candidates.jsonl.manifest.json");
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
-    assert_eq!(manifest["schema"], 6);
+    assert_eq!(manifest["schema"], 8);
     assert_eq!(manifest["candidate_schema"], 4);
     assert_eq!(manifest["attempted_candidates"], 300);
     assert_eq!(manifest["rejected_invalid_candidates"], 0);
@@ -244,6 +298,183 @@ fn repeated_search_has_matching_candidate_content() {
         assert!(output.status.success());
     }
     assert_eq!(fs::read(left).unwrap(), fs::read(right).unwrap());
+}
+
+#[test]
+fn search_accepts_immutable_feedback_and_records_its_identity() {
+    let directory = tempdir().unwrap();
+    let output_path = directory.path().join("guided.jsonl");
+    let feedback_path = directory.path().join("feedback.json");
+    fs::write(
+        &feedback_path,
+        serde_json::json!({
+            "schema": 1,
+            "dataset_id": "cli-synthetic-guidance-v1",
+            "context_checksum": "fixture-context",
+            "outcome_label": "synthetic utility",
+            "feature_scales": {"depth": 10.0, "nodes": 40.0},
+            "records": [
+                {
+                    "record_id": "small",
+                    "features": {"depth": 1.0, "nodes": 1.0},
+                    "outcome": -0.5,
+                    "confidence": 1.0
+                },
+                {
+                    "record_id": "large",
+                    "features": {"depth": 6.0, "nodes": 30.0},
+                    "outcome": 0.5,
+                    "confidence": 1.0
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = command()
+        .args([
+            "search",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--feedback",
+            feedback_path.to_str().unwrap(),
+            "--feedback-neighbors",
+            "1",
+            "--feedback-minimum-neighbors",
+            "1",
+            "--feedback-maximum-distance",
+            "1",
+            "--feedback-elite-parent-count",
+            "4",
+            "--duration-seconds",
+            "10",
+            "--max-candidates",
+            "300",
+            "--threads",
+            "2",
+            "--seed",
+            "7",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["measured_feedback"]["dataset_id"],
+        "cli-synthetic-guidance-v1"
+    );
+    assert!(payload["guided_population_candidates"].as_u64().unwrap() > 0);
+    assert_eq!(payload["feedback_elite_parent_count"], 4);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.path().join("guided.jsonl.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["schema"], 8);
+    assert_eq!(
+        manifest["measured_feedback"]["dataset_id"],
+        "cli-synthetic-guidance-v1"
+    );
+    assert_eq!(manifest["feedback_elite_parent_count"], 4);
+}
+
+#[test]
+fn search_applies_and_audits_opt_in_feedback_operator_policy() {
+    let directory = tempdir().unwrap();
+    let output_path = directory.path().join("operator-policy.jsonl");
+    let action_archive = directory.path().join("action-archive.jsonl");
+    let feedback_path = directory.path().join("operator-feedback.json");
+    write_action_archive(&action_archive);
+    let records = [
+        ("mean-a", 0.0, 1.0, 0.8),
+        ("mean-b", 0.0, 1.0, 0.7),
+        ("mean-c", 0.0, 2.0, 0.6),
+        ("rank-a", 1.0, 0.0, -0.8),
+        ("rank-b", 1.0, 0.0, -0.7),
+        ("rank-c", 2.0, 0.0, -0.6),
+    ]
+    .into_iter()
+    .map(|(id, rank, mean, outcome)| {
+        serde_json::json!({
+            "record_id": id,
+            "features": {
+                "operator_rank_count": rank,
+                "operator_ts_mean_count": mean
+            },
+            "outcome": outcome,
+            "confidence": 1.0
+        })
+    })
+    .collect::<Vec<_>>();
+    fs::write(
+        &feedback_path,
+        serde_json::json!({
+            "schema": 1,
+            "dataset_id": "cli-operator-policy-v1",
+            "context_checksum": "fixture-context",
+            "outcome_label": "synthetic operator utility",
+            "feature_scales": {
+                "operator_rank_count": 1.0,
+                "operator_ts_mean_count": 1.0
+            },
+            "records": records
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = command()
+        .args([
+            "search",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--feedback",
+            feedback_path.to_str().unwrap(),
+            "--feedback-operator-policy-strength",
+            "0.5",
+            "--feedback-action-archive",
+            action_archive.to_str().unwrap(),
+            "--duration-seconds",
+            "10",
+            "--max-candidates",
+            "300",
+            "--threads",
+            "2",
+            "--seed",
+            "7",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(payload["operator_policy"]["adjusted_catalog_checksum"].is_string());
+    assert_eq!(
+        payload["operator_policy"]["transform_action_source"],
+        "external_action_archive"
+    );
+    assert!(payload["operator_policy"]["transform_action_archive_checksum"].is_string());
+    assert!(
+        payload["operator_policy"]["generation_weights"]["ts_mean"]
+            .as_u64()
+            .unwrap()
+            > payload["operator_policy"]["generation_weights"]["rank"]
+                .as_u64()
+                .unwrap()
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.path().join("operator-policy.jsonl.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["operator_policy"]["adjusted_catalog_checksum"],
+        manifest["operator_catalog_checksum"]
+    );
 }
 
 #[test]
@@ -404,6 +635,48 @@ fn benchmark_reports_reproducible_checksums_and_timings() {
     assert!(payload["trials"][0]["rejected_invalid_candidates"].is_number());
     assert!(payload["trials"][0]["rejected_duplicate_candidates"].is_number());
     assert!(payload["trials"][0]["wall_milliseconds"].is_number());
+    assert!(payload["trials"][0]["semantic_family_yield"].is_number());
+    assert!(payload["trials"][0]["semantic_families_per_second"].is_number());
+    assert_eq!(
+        payload["deterministic_across_repetitions_and_thread_counts"],
+        true
+    );
+    assert_eq!(
+        payload["engineering_checks"]["zero_invalid_emissions"],
+        true
+    );
+    assert_eq!(payload["engineering_checks"]["bounded_populations"], true);
+    assert_eq!(
+        payload["engineering_checks"]["duplicate_rejection_observed"],
+        true
+    );
+}
+
+#[test]
+fn benchmark_accepts_multiple_seeds_and_repetitions() {
+    let output = command()
+        .args([
+            "benchmark",
+            "--candidates",
+            "150",
+            "--threads",
+            "1,2",
+            "--seeds",
+            "8,9",
+            "--repetitions",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["seeds"], serde_json::json!([8, 9]));
+    assert_eq!(payload["repetitions"], 2);
+    assert_eq!(payload["trials"].as_array().unwrap().len(), 8);
 }
 
 #[test]
@@ -417,9 +690,15 @@ fn search_help_preserves_public_resource_flags() {
         "--max-candidates",
         "--threads",
         "--seed",
+        "--seeded-catalog-scaffold",
+        "--catalog-scaffold-policy",
+        "--freeze-seed-parents",
         "--max-depth",
         "--max-nodes",
         "--max-operators",
+        "--population-capacity",
+        "--parent-pool-capacity",
+        "--feedback-elite-parent-count",
     ] {
         assert!(stdout.contains(flag));
     }
@@ -446,6 +725,10 @@ fn search_records_configurable_expression_limits() {
             "96",
             "--max-operators",
             "48",
+            "--population-capacity",
+            "256",
+            "--parent-pool-capacity",
+            "32",
         ])
         .output()
         .unwrap();
@@ -460,6 +743,14 @@ fn search_records_configurable_expression_limits() {
     assert_eq!(manifest["search_spec"]["limits"]["max_depth"], 12);
     assert_eq!(manifest["search_spec"]["limits"]["max_nodes"], 96);
     assert_eq!(manifest["search_spec"]["limits"]["max_operators"], 48);
+    assert_eq!(
+        manifest["search_spec"]["resources"]["population_capacity"],
+        256
+    );
+    assert_eq!(
+        manifest["search_spec"]["resources"]["parent_pool_capacity"],
+        32
+    );
 }
 
 #[test]
@@ -728,27 +1019,47 @@ fn evaluate_batch_loads_one_dataset_and_publishes_every_candidate() {
     let values = (0..24)
         .map(|index| Some(f64::from(index) - 12.0))
         .collect::<Vec<_>>();
+    let volume = (0..24)
+        .map(|index| Some(f64::from(24 - index)))
+        .collect::<Vec<_>>();
     let payload = serde_json::json!({
         "schema": 1,
         "dataset_id": "cli-batch-synthetic-v1",
         "timestamps": (0..12).collect::<Vec<_>>(),
         "assets": ["a", "b"],
-        "fields": {"close": {"values": values}},
+        "fields": {"close": {"values": values}, "volume": {"values": volume}},
         "realized_returns": {"values": (0..24).map(|index| Some(if index % 2 == 0 { 0.01 } else { -0.01 })).collect::<Vec<_>>()},
         "groups": {"sector": ["one", "one"]},
         "source_label": "license-safe synthetic CLI batch fixture",
         "preprocessing": ["none"]
     });
     fs::write(&dataset, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
-    fs::write(
-        &input,
-        format!(
-            "{}\n{}\n",
-            candidate_line("rank(close)"),
-            candidate_line("ts_zscore(close, 2)")
-        ),
-    )
-    .unwrap();
+    let expressions = [
+        "rank(close)",
+        "ts_zscore(close, 2)",
+        "abs(close)",
+        "sign(close)",
+        "ts_delay(close, 2)",
+        "ts_sum(close, 3)",
+        "ts_var(close, 3)",
+        "ts_skew(close, 3)",
+        "ts_kurt(close, 3)",
+        "ts_min(close, 3)",
+        "ts_max(close, 3)",
+        "ts_median(close, 3)",
+        "ts_mad(close, 3)",
+        "ts_wma(close, 3)",
+        "ts_ema(close, 3)",
+        "ts_cov(close, volume, 3)",
+        "ts_corr(close, volume, 3)",
+    ];
+    let input_payload = expressions
+        .iter()
+        .map(|expression| candidate_line(expression))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&input, input_payload).unwrap();
     let output = command()
         .args([
             "evaluate-batch",
@@ -778,7 +1089,7 @@ fn evaluate_batch_loads_one_dataset_and_publishes_every_candidate() {
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["succeeded"], 2);
+    assert_eq!(summary["succeeded"], expressions.len());
     assert_eq!(summary["failed"], 0);
     assert_eq!(summary["threads"], 2);
     let rows = fs::read_to_string(evidence)
@@ -786,7 +1097,7 @@ fn evaluate_batch_loads_one_dataset_and_publishes_every_candidate() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), expressions.len());
     assert!(rows.iter().all(|row| row["status"] == "succeeded"));
     assert!(
         rows.iter()

@@ -187,6 +187,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Test version selection
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -214,7 +217,10 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): v${version}"
+          # A prepared version is already committed by the reviewed PR.
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v${version}"
+          fi
           git tag -a "v${version}" -m "v${version}"
           # A plain push, so a branch that moved under us fails loudly instead
           # of overwriting someone else's commit.
@@ -472,6 +478,13 @@ jobs:
           Generated candidates are research hypotheses, not trading
           recommendations. See the README for the full scope statement.
           NOTES
+
+          # Release-specific changes and migration notes live in the reviewed
+          # tree. Historical/manual versions without notes keep the defaults.
+          if [ -f "docs/releases/${VERSION}.md" ]; then
+            printf '\n' >> release-notes.md
+            cat "docs/releases/${VERSION}.md" >> release-notes.md
+          fi
 
           gh release create "v${VERSION}" \
             --title "v${VERSION}" \

@@ -23,6 +23,19 @@ AlphaWinnow is not a trading bot, broker integration, or hosted alpha database.
 It runs locally, performs no network requests, and never claims that a generated
 formula is profitable.
 
+## What's new in 0.2.0
+
+This checkout prepares **0.2.0**; publication is a separate release step.
+The release adds a bounded ask/tell library API for caller-measured search,
+opt-in feedback-guided search policies, and an expanded causal numeric operator
+backend. It also changes semantic identity for nested cross-sectional ranks
+and upgrades search artifact schemas. See the [changelog](CHANGELOG.md) and
+[migration notes](docs/releases/0.2.0.md) before resuming old work.
+
+These are toolkit capabilities, not a claim of better trading performance or
+superiority over AlphaGen. Research adapters, private datasets, and experiment
+outputs are not part of the published crate.
+
 ## Why AlphaWinnow?
 
 Most alpha factor generators can produce thousands of formulas. The difficult
@@ -165,10 +178,10 @@ pulling in a command-line stack:
 
 ```toml
 [dependencies]
-alphawinnow = { version = "0.1", default-features = false }
+alphawinnow = { version = "0.2", default-features = false }
 
 # With optional causal numeric evaluation and local Parquet preparation:
-# alphawinnow = { version = "0.1", default-features = false, features = ["parquet-input"] }
+# alphawinnow = { version = "0.2", default-features = false, features = ["parquet-input"] }
 ```
 
 ```rust
@@ -181,6 +194,37 @@ fn main() -> Result<(), alphawinnow::ExpressionError> {
     Ok(())
 }
 ```
+
+### Drive search with your own evaluator
+
+`alphawinnow::measured_search::MeasuredSearchSession` provides a separate,
+bounded ask/tell loop, usable without the `cli` or `numeric-evidence` features:
+
+1. `ask()` emits typed, semantically unique proposals with lineage.
+2. Evaluate **all** `score_requests()` under your declared evaluator context.
+3. `tell()` accepts one complete finite-outcome snapshot; larger is better.
+4. Save `checkpoint_json()` and restore with the identical config and catalog.
+
+The default `Score` policy requests fresh scores for retained parents as well
+as the pending batch. `LatestBatchScoreV1` instead ranks the latest cohort and
+retires incumbents; its outcomes can represent sequential admission events,
+not simultaneous marginal contributions. `LatestBatchUniformV1` is a
+score-blind same-cohort control, **not** independent grammar-random search.
+Other policies and constraints are documented in the module's Rust API.
+
+Try the complete [synthetic example](crates/alphawinnow/examples/measured_search.rs):
+
+```bash
+cargo run --example measured_search --no-default-features --locked
+```
+
+It rewards smaller expressions, supplies no market data, and verifies
+checkpoint restoration after each batch. For another-language evaluator, the
+[stdio example](crates/alphawinnow/examples/measured_search_stdio.rs) exposes
+the same public API over local JSONL; it is an example, not a hosted service.
+The session bounds attempts, emitted proposals, batch/parent counts, and AST
+complexity. It does not time-limit the caller's evaluator. Budget rescoring
+and evaluation time explicitly; `max_evaluations` counts new proposals only.
 
 ## How it works
 
@@ -345,10 +389,17 @@ the network.
 Supported signal operators are:
 
 - arithmetic: `add(a, b, ...)`, `subtract(a, b)`,
-  `multiply(signal, scalar, ...)`, `divide(signal, nonzero_scalar)`, `negate(a)`;
-- time series: `ts_rank(a, window)`, `ts_mean(a, window)`,
-  `ts_std_dev(a, window)`, `ts_zscore(a, window)`, and
-  `ts_delta(a, window)`, with integer windows in `2..=512`;
+  `multiply(signal, scalar, ...)`, `divide(signal, nonzero_scalar)`, `negate(a)`,
+  `abs(a)`, and `sign(a)`;
+- time series: `ts_delay(a, window)`, `ts_rank(a, window)`,
+  `ts_mean(a, window)`, `ts_sum(a, window)`, `ts_std_dev(a, window)`,
+  `ts_var(a, window)`, `ts_skew(a, window)`, `ts_kurt(a, window)`,
+  `ts_min(a, window)`, `ts_max(a, window)`, `ts_median(a, window)`,
+  `ts_mad(a, window)`, `ts_wma(a, window)`, `ts_ema(a, window)`,
+  `ts_zscore(a, window)`, and `ts_delta(a, window)`, with integer windows in
+  `2..=512`;
+- pairwise time series: `ts_cov(a, b, window)` and
+  `ts_corr(a, b, window)`;
 - cross sectional: `rank(a)`, `zscore(a)`,
   `group_rank(a, group("sector"))`;
 - conditions: `greater(signal, scalar)` and
@@ -361,6 +412,11 @@ Unknown operators, incorrect arity or kinds, invalid windows, non-finite
 scalars, unsupported keywords, non-literal keyword values, and out-of-range
 operator parameters are rejected before search or deduplication.
 
+With the `numeric-evidence` feature, every generation-enabled embedded
+operator has a causal local numeric backend. Evaluator construction fails
+closed for a custom catalog that enables generation for an operator without a
+backend, preventing search and evaluation spaces from silently diverging.
+
 Formatting normalizes numeric spelling and keyword order. `add` and
 `multiply` operands are sorted because those registry entries are explicitly
 commutative. Exact fingerprints are SHA-256 hashes of exact canonical text.
@@ -371,6 +427,12 @@ a normalized negative direction. Thus `close`, `multiply(close, 6)`,
 `multiply(close, -2)` remains directionally distinct. Scaling inside a
 nonlinear operator, condition, clipping/winsorization step, or one composite
 sleeve is never moved across that boundary.
+
+Starting in 0.2.0, nested cross-sectional `rank(rank(x))` also shares a
+semantic family with `rank(x)`. This narrow identity does not merge time-series
+or grouped ranks, and does not remove scaling inside `rank`. Exact canonical
+fingerprints are unchanged by this semantic rule; affected semantic fingerprints
+must be recomputed when migrating an archive.
 
 The same conservative pass rejects roots proven to be zero or constant, such
 as `subtract(close, close)`, multiplication by zero, or `rank` of a proven-zero
@@ -481,7 +543,7 @@ descriptor:
 }
 ```
 
-The adjacent compatibility file `OUTPUT.manifest.json` has `schema: 6`,
+The adjacent compatibility file `OUTPUT.manifest.json` has `schema: 8`,
 `candidate_schema: 4`, tool
 version, complete search specification and scoring weights, configuration
 checksum, archive and candidate counters, `rejected_trivial_candidates`, a
@@ -489,14 +551,16 @@ machine-readable `rejection_reasons` map, archive accepted/duplicate/rejected
 counters and reasons, invalid-transform count, accepted/retained transform-kind
 counts, completed generations, all resident capacities and peaks, elapsed
 milliseconds, termination reason, and SHA-256 of the exact candidate JSONL
-content.
+content. It also records measured-feedback identity, optional operator-policy
+weights and provenance, archive-seeding controls, and the catalog-scaffold policy.
 
 Candidate and manifest bytes are first written and synced as an immutable pair
 under `.OUTPUT.runs/`. Only then is `OUTPUT.current.json` atomically replaced.
 Readers following that pointer cannot pair a new candidate file with a stale
 manifest. The adjacent candidate and manifest paths remain compatibility
 aliases and are refreshed after publication; damaging either alias does not
-damage the last complete pointed-to run. Checkpoints use schema 1 and the same
+damage the last complete pointed-to run. Structural-search checkpoints use
+schema 2 and the same
 temporary-file, `sync_all`, atomic-rename protocol.
 
 ## Optional numeric evidence
@@ -630,18 +694,56 @@ signs exist). This is a deterministic leakage check for comparing feature sets
 or neighbor settings, not evidence that the supplied outcomes generalize to a
 new dataset or context.
 
+Measured evidence can also guide the structural search's parent selection:
+
+```bash
+alphawinnow search \
+  --feedback examples/public-feedback-v1.json \
+  --output guided-search.jsonl \
+  --max-candidates 2000 --duration-seconds 60 --threads 1 --seed 7
+```
+
+`--seed-from-archive` initializes parents from accepted `--archive` records;
+`--freeze-seed-parents` additionally requires feedback and keeps that seeded
+parent set fixed. `--feedback-elite-parent-count` reserves parent slots for the
+measured-feedback ranking. All are explicit opt-ins, and guidance remains
+separate from `structural_score`. The public feedback fixture is synthetic.
+
+`search --feedback-operator-policy-strength 0.5` additionally opts into an
+outcome-aware generation policy when the feedback contains
+`operator_<name>_count` features. It converts confidence-weighted operator
+outcomes into bounded catalog weights, preserves positive exploration for every
+enabled operator, and records the configuration checksum, base and adjusted
+catalog checksums, and exact weights in the run manifest. Without this flag,
+search does not apply feedback-derived operator weights. This is not a
+cross-version byte-compatibility guarantee: the 0.2 catalog and semantic rules
+also changed. `--catalog-scaffold-policy` separately selects `fixed`,
+`seeded-diverse`, or `motif-diverse` initial coverage; `--seeded-catalog-scaffold`
+remains an alias for seeded-diverse coverage.
+
 ## Reproducible benchmark
 
-Command:
+Command (structural-search throughput, not predictive performance):
 
 ```bash
 cargo run --release -q -p alphawinnow -- \
   benchmark --candidates 20000 --threads 1,4 --seed 20260828
 ```
 
-The phase rows were measured 2026-08-28 and the final row on 2026-09-04, both
-on the same Apple M1 Pro, Darwin arm64, Rust/Cargo 1.92.0. The review baseline
-preceded the Phase 1 semantic/triviality pass:
+For repeated measurements use `--seeds 7,15,42 --repetitions 3`.
+
+The [0.2.0 preparation measurement](docs/releases/0.2.0-structural-benchmark.json)
+used 20,000 candidates, seed 20260828, 1/4 threads and three repetitions on
+2026-09-30 (Apple M1 Pro, macOS arm64, Rust 1.98.1). All six trials produced
+the same candidate checksum and 17,185 semantic families, with zero invalid
+emissions. Median wall time was 5,105 ms with one thread and 2,155 ms with four.
+These are local observations, not portable speed guarantees or market results.
+The historical rows below describe earlier trees; catalog and identity changes
+can alter counts and checksums across versions.
+
+The phase rows were measured 2026-08-28, with later current-tree measurements
+on 2026-09-04 and 2026-09-08, all on the same Apple M1 Pro, Darwin arm64. The
+review baseline preceded the Phase 1 semantic/triviality pass:
 
 | Version | Threads | Generated | Semantic families | Trivial rejects | Duplicate rejects | Retained | Wall time | Candidate SHA-256 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
@@ -665,6 +767,8 @@ preceded the Phase 1 semantic/triviality pass:
 | Phase 9 | 4 | 20,000 | 16,587 | 49 | 3,364 | 100 | 2,433 ms | `af46848c82daf83d57a1a111301e63e4ca99cd7b3f0f0513a1a5aab972e5d8f8` |
 | Re-measured 2026-09-04 | 1 | 20,000 | 15,850 | 38 | 4,112 | 100 | 4,725 ms | `66df757199e55116f283747f74bdb917c59c1a50ea4f813a66182feb92a40e12` |
 | Re-measured 2026-09-04 | 4 | 20,000 | 15,850 | 38 | 4,112 | 100 | 2,046 ms | `66df757199e55116f283747f74bdb917c59c1a50ea4f813a66182feb92a40e12` |
+| Re-measured 2026-09-08 | 1 | 20,000 | 16,968 | 70 | 2,962 | 100 | 4,905 ms | `61d9fefe25bdd491524bc1e313a6dca14c5d24199a885b1f40e2a88711e0b378` |
+| Re-measured 2026-09-08 | 4 | 20,000 | 16,968 | 70 | 2,962 | 100 | 2,500 ms | `61d9fefe25bdd491524bc1e313a6dca14c5d24199a885b1f40e2a88711e0b378` |
 
 Phase 1 rejected 23 proven-zero and 29 proven-constant expressions. The
 semantic-family count fell by 154: 52 explicit trivial rejections plus 102
@@ -720,16 +824,13 @@ crossover, 24 fallback-generation, and 17 initial records. A separate bounded
 additional diversity bookkeeping increases wall time; one- and four-thread
 candidate checksums remain identical.
 
-The final row is a re-run of the identical fixed workload against the current
-tree, not a new optimization. It retains 15,850 semantic families and a mix of
-32 mutation, 29 crossover, 22 fallback-generation, and 17 initial records over
-157 generations, rejecting 38 trivial expressions (28 provably zero, 10 provably
-constant) and 4,112 duplicates. Its counts and candidate checksum differ from
-the Phase 9 row, so that row no longer describes this tree; the score-ordered
-shortlist fallback for deadline-terminated runs is not the cause, because that
-path stays inactive when a run stops on `max_candidates` and disabling it
-reproduces the same checksum. Wall times are the median of three consecutive
-runs; one- and four-thread bytes still match.
+The 2026-09-04 rows were a re-run of the identical fixed workload after the
+Phase 9 work. The 2026-09-08 rows describe the expanded built-in catalog: they
+retain 16,968 semantic families, reject 70 trivial expressions and 2,962
+duplicates, and produce the same candidate checksum with one and four threads.
+The changed counts and checksum are expected because the generation-enabled
+operator set changed. Wall times are local observations and are not a portable
+speedup claim.
 
 These are observations from one workload and environment, not a hard-coded
 speedup claim. The command reports full configuration, counts, checksums,
@@ -840,7 +941,7 @@ Actions, plus a few that are impractical to run locally on every change:
 | `ci.yml` &rarr; `library-graph` | that no CLI-only dependency is reachable without the `cli` feature, so `default-features = false` stays genuinely lean |
 | `audit.yml` | `cargo audit` and `cargo deny` over advisories, licenses, sources, and the banned-dependency policy in [`deny.toml`](deny.toml) |
 | `codeql.yml`, `secrets.yml`, `scorecard.yml` | static analysis, verified-secret scanning, and OpenSSF Scorecard |
-| `release.yml` | raises the version from the Conventional Commits since the last tag, then tags, verifies, and publishes it; see [`docs/releasing.md`](docs/releasing.md) |
+| `release.yml` | verifies first, preserves a prepared version or raises it from Conventional Commits, then tags, builds, and publishes; see [`docs/releasing.md`](docs/releasing.md) |
 | `docs.yml` | rustdoc for `main`, published to [GitHub Pages](https://eslazarev.github.io/alphawinnow/) |
 
 `deny.toml` also encodes the local-only product boundary: no HTTP or TLS crate
@@ -870,7 +971,7 @@ AlphaWinnow is available under the [MIT License](LICENSE).
   than byte-identical between repeated runs; candidate JSONL is the
   reproducible content artifact.
 
-The review-driven Phases 1–9 and the Radiate decision gate are complete. The
-generic measured-feedback prioritizer remains separate from structural score.
-The next smallest milestone is a streaming Arrow/Parquet adapter for the
-numeric feature; it must not add remote platform integration.
+Measured guidance and caller-supplied ask/tell outcomes remain separate from
+structural scores. Their availability is not evidence of predictive superiority.
+Streaming Arrow/Parquet evaluation and stronger independent validation remain
+future work; see the roadmap. Neither requires remote platform integration.

@@ -514,4 +514,26 @@ mod tests {
         assert!(catalog.field("synthetic_quality").is_some());
         crate::parse_expression_with_catalog("rank(synthetic_quality)", &catalog).unwrap();
     }
+
+    #[test]
+    fn alpha158_like_rolling_operators_are_typed_and_parseable() {
+        for expression in [
+            "abs(ts_delay(close, 20))",
+            "sign(ts_sum(volume, 5))",
+            "ts_var(close, 10)",
+            "ts_skew(close, 10)",
+            "ts_kurt(close, 10)",
+            "ts_max(high, 20)",
+            "ts_min(low, 20)",
+            "ts_median(open, 10)",
+            "ts_mad(close, 10)",
+            "ts_wma(close, 20)",
+            "ts_ema(close, 20)",
+            "ts_cov(close, volume, 20)",
+            "ts_corr(close, volume, 20)",
+        ] {
+            let parsed = crate::parse_expression(expression).unwrap();
+            assert_eq!(parsed.kind(), ExprKind::Signal, "{expression}");
+        }
+    }
 }

@@ -306,6 +306,7 @@ impl<'a> NumericEvaluator<'a> {
     ) -> Result<Self, NumericError> {
         dataset.validate()?;
         config.validate(dataset.timestamps.len())?;
+        validate_generation_enabled_numeric_backends(catalog)?;
         let dataset_checksum = dataset.checksum()?;
         Ok(Self {
             dataset,
@@ -465,6 +466,16 @@ fn evaluate(expression: &Expr, dataset: &ColumnarDataset) -> Result<Evaluated, N
             let input = signal(evaluate(arg, dataset)?, op)?;
             let result = match op.as_str() {
                 "negate" => map_column(&input, |value| -value),
+                "abs" => map_column(&input, f64::abs),
+                "sign" => map_column(&input, |value| {
+                    if value > 0.0 {
+                        1.0
+                    } else if value < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                }),
                 "rank" => cross_sectional(&input, dataset, rank_values),
                 "zscore" => cross_sectional(&input, dataset, zscore_values),
                 "winsorize" => {
@@ -483,7 +494,9 @@ fn evaluate(expression: &Expr, dataset: &ColumnarDataset) -> Result<Evaluated, N
         Expr::BinaryCall {
             op, left, right, ..
         } => match op.as_str() {
-            "ts_rank" | "ts_mean" | "ts_std_dev" | "ts_zscore" | "ts_delta" => {
+            "ts_rank" | "ts_mean" | "ts_std_dev" | "ts_zscore" | "ts_delta" | "ts_delay"
+            | "ts_sum" | "ts_var" | "ts_skew" | "ts_kurt" | "ts_min" | "ts_max" | "ts_median"
+            | "ts_mad" | "ts_wma" | "ts_ema" => {
                 let input = signal(evaluate(left, dataset)?, op)?;
                 let evaluated = evaluate(right, dataset)?;
                 let window = scalar(&evaluated, op)?;
@@ -519,6 +532,16 @@ fn evaluate(expression: &Expr, dataset: &ColumnarDataset) -> Result<Evaluated, N
             _ => Err(unsupported(op)),
         },
         Expr::VariadicCall { op, args, .. } => match op.as_str() {
+            "ts_cov" | "ts_corr" => {
+                let left = signal(evaluate(&args[0], dataset)?, op)?;
+                let right = signal(evaluate(&args[1], dataset)?, op)?;
+                let evaluated = evaluate(&args[2], dataset)?;
+                let window = scalar(&evaluated, op)?;
+                let window = scalar_to_window(window)?;
+                Ok(Evaluated::Signal(pair_time_series(
+                    op, &left, &right, dataset, window,
+                )))
+            }
             "add" | "multiply" => {
                 let mut columns = Vec::new();
                 let mut scalars = Vec::new();
@@ -634,6 +657,62 @@ fn group(value: Evaluated, operator: &str) -> Result<String, NumericError> {
 
 fn unsupported(operator: &str) -> NumericError {
     NumericError::Evaluation(format!("operator `{operator}` has no numeric backend"))
+}
+
+fn has_numeric_backend(operator: &str) -> bool {
+    matches!(
+        operator,
+        "negate"
+            | "abs"
+            | "sign"
+            | "rank"
+            | "zscore"
+            | "ts_rank"
+            | "ts_mean"
+            | "ts_std_dev"
+            | "ts_zscore"
+            | "ts_delta"
+            | "ts_delay"
+            | "ts_sum"
+            | "ts_var"
+            | "ts_skew"
+            | "ts_kurt"
+            | "ts_min"
+            | "ts_max"
+            | "ts_median"
+            | "ts_mad"
+            | "ts_wma"
+            | "ts_ema"
+            | "ts_cov"
+            | "ts_corr"
+            | "subtract"
+            | "divide"
+            | "greater"
+            | "group_rank"
+            | "add"
+            | "multiply"
+            | "if_else"
+            | "winsorize"
+            | "clip"
+    )
+}
+
+fn validate_generation_enabled_numeric_backends(catalog: &Catalog) -> Result<(), NumericError> {
+    let unsupported: Vec<_> = catalog
+        .operators
+        .iter()
+        .filter(|operator| operator.generation_weight > 0)
+        .filter(|operator| !has_numeric_backend(&operator.name))
+        .map(|operator| operator.name.as_str())
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(NumericError::Evaluation(format!(
+            "generation-enabled operators lack numeric backends: {}",
+            unsupported.join(", ")
+        )))
+    }
 }
 
 fn scalar_kwarg(kwargs: &BTreeMap<String, Expr>, name: &str) -> Result<f64, NumericError> {
@@ -758,30 +837,35 @@ fn time_series(
         for asset in 0..assets {
             let index = row * assets + asset;
             match operator {
-                "ts_delta" if row >= window => {
+                "ts_delta" | "ts_delay" if row >= window => {
                     result[index] = match (
                         input.values[index],
                         input.values[(row - window) * assets + asset],
                     ) {
+                        (_, Some(previous)) if operator == "ts_delay" => Some(previous),
                         (Some(current), Some(previous)) => Some(current - previous),
                         _ => None,
                     };
                 }
-                "ts_mean" | "ts_std_dev" | "ts_zscore" | "ts_rank" if row + 1 >= window => {
+                "ts_mean" | "ts_sum" | "ts_std_dev" | "ts_zscore" | "ts_var" | "ts_skew"
+                | "ts_kurt" | "ts_min" | "ts_max" | "ts_median" | "ts_mad" | "ts_rank"
+                | "ts_wma" | "ts_ema"
+                    if row + 1 >= window =>
+                {
                     let start = row + 1 - window;
                     let values: Vec<_> = (start..=row)
                         .map(|item| input.values[item * assets + asset])
                         .collect();
                     if values.iter().all(Option::is_some) {
+                        let observed: Vec<_> = values.iter().flatten().copied().collect();
                         match operator {
+                            "ts_sum" => {
+                                result[index] = Some(observed.iter().sum());
+                            }
                             "ts_mean" => {
-                                let sum = values.iter().flatten().sum::<f64>();
-                                result[index] = Some(
-                                    sum / f64::from(u32::try_from(window).unwrap_or(u32::MAX)),
-                                );
+                                result[index] = mean(&observed);
                             }
                             "ts_std_dev" | "ts_zscore" => {
-                                let observed: Vec<_> = values.iter().flatten().copied().collect();
                                 if let Some((mean, deviation)) = mean_and_deviation(&observed) {
                                     result[index] = Some(if operator == "ts_std_dev" {
                                         deviation
@@ -792,9 +876,36 @@ fn time_series(
                                     });
                                 }
                             }
+                            "ts_var" => {
+                                result[index] = sample_variance(&observed);
+                            }
+                            "ts_skew" => {
+                                result[index] = skewness(&observed);
+                            }
+                            "ts_kurt" => {
+                                result[index] = excess_kurtosis_with_sample_variance(&observed);
+                            }
+                            "ts_min" => {
+                                result[index] = observed.iter().copied().reduce(f64::min);
+                            }
+                            "ts_max" => {
+                                result[index] = observed.iter().copied().reduce(f64::max);
+                            }
+                            "ts_median" => {
+                                result[index] = lower_median(&observed);
+                            }
+                            "ts_mad" => {
+                                result[index] = mean_absolute_deviation(&observed);
+                            }
                             "ts_rank" => {
                                 let ranked = rank_values(&values);
                                 result[index] = ranked[window - 1];
+                            }
+                            "ts_wma" => {
+                                result[index] = weighted_moving_average(&observed);
+                            }
+                            "ts_ema" => {
+                                result[index] = exponential_moving_average(&observed);
                             }
                             _ => unreachable!(),
                         }
@@ -802,6 +913,168 @@ fn time_series(
                 }
                 _ => {}
             }
+        }
+    }
+    NumericColumn { values: result }
+}
+
+fn sample_variance(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let average = mean(values)?;
+    let denominator = f64::from(u32::try_from(values.len() - 1).ok()?);
+    Some(
+        values
+            .iter()
+            .map(|value| (value - average).powi(2))
+            .sum::<f64>()
+            / denominator,
+    )
+}
+
+fn skewness(values: &[f64]) -> Option<f64> {
+    let average = mean(values)?;
+    let count = f64::from(u32::try_from(values.len()).ok()?);
+    let second = values
+        .iter()
+        .map(|value| (value - average).powi(2))
+        .sum::<f64>()
+        / count;
+    if second == 0.0 {
+        return None;
+    }
+    let third = values
+        .iter()
+        .map(|value| (value - average).powi(3))
+        .sum::<f64>()
+        / count;
+    Some(third / second.powf(1.5))
+}
+
+fn excess_kurtosis_with_sample_variance(values: &[f64]) -> Option<f64> {
+    let average = mean(values)?;
+    let count = f64::from(u32::try_from(values.len()).ok()?);
+    let variance = sample_variance(values)?;
+    if variance == 0.0 {
+        return None;
+    }
+    let fourth = values
+        .iter()
+        .map(|value| (value - average).powi(4))
+        .sum::<f64>()
+        / count;
+    Some(fourth / variance.powi(2) - 3.0)
+}
+
+fn lower_median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    Some(ordered[(ordered.len() - 1) / 2])
+}
+
+fn mean_absolute_deviation(values: &[f64]) -> Option<f64> {
+    let average = mean(values)?;
+    mean(
+        &values
+            .iter()
+            .map(|value| (value - average).abs())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn weighted_moving_average(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let denominator = values
+        .iter()
+        .enumerate()
+        .map(|(index, _)| f64::from(u32::try_from(index).ok().unwrap_or(u32::MAX)))
+        .sum::<f64>();
+    (denominator > 0.0).then(|| {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value * f64::from(u32::try_from(index).unwrap_or(u32::MAX)))
+            .sum::<f64>()
+            / denominator
+    })
+}
+
+fn exponential_moving_average(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let count = f64::from(u32::try_from(values.len()).ok()?);
+    let alpha = 1.0 - 2.0 / (1.0 + count);
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for (index, value) in values.iter().enumerate() {
+        let power = i32::try_from(values.len() - index).ok()?;
+        let weight = alpha.powi(power);
+        numerator += weight * value;
+        denominator += weight;
+    }
+    (denominator > 0.0).then_some(numerator / denominator)
+}
+
+fn pair_time_series(
+    operator: &str,
+    left: &NumericColumn,
+    right: &NumericColumn,
+    dataset: &ColumnarDataset,
+    window: usize,
+) -> NumericColumn {
+    let rows = dataset.timestamps.len();
+    let assets = dataset.assets.len();
+    let mut result = vec![None; rows * assets];
+    for row in window.saturating_sub(1)..rows {
+        let start = row + 1 - window;
+        for asset in 0..assets {
+            let pairs: Option<Vec<_>> = (start..=row)
+                .map(|item| {
+                    left.values[item * assets + asset].zip(right.values[item * assets + asset])
+                })
+                .collect();
+            let Some(pairs) = pairs else {
+                continue;
+            };
+            let left_values: Vec<_> = pairs.iter().map(|pair| pair.0).collect();
+            let right_values: Vec<_> = pairs.iter().map(|pair| pair.1).collect();
+            let Some(left_mean) = mean(&left_values) else {
+                continue;
+            };
+            let Some(right_mean) = mean(&right_values) else {
+                continue;
+            };
+            let covariance_numerator = pairs
+                .iter()
+                .map(|(left, right)| (left - left_mean) * (right - right_mean))
+                .sum::<f64>();
+            let value = if operator == "ts_cov" {
+                let denominator =
+                    f64::from(u32::try_from(window.saturating_sub(1)).unwrap_or(u32::MAX));
+                (denominator > 0.0).then_some(covariance_numerator / denominator)
+            } else {
+                let left_variance = left_values
+                    .iter()
+                    .map(|value| (value - left_mean).powi(2))
+                    .sum::<f64>();
+                let right_variance = right_values
+                    .iter()
+                    .map(|value| (value - right_mean).powi(2))
+                    .sum::<f64>();
+                if left_variance < 1e-6 || right_variance < 1e-6 {
+                    Some(covariance_numerator)
+                } else {
+                    Some(covariance_numerator / (left_variance * right_variance).sqrt())
+                }
+            };
+            result[row * assets + asset] = value;
         }
     }
     NumericColumn { values: result }
@@ -1173,6 +1446,50 @@ mod tests {
         }
     }
 
+    fn expanded_operator_fixture() -> ColumnarDataset {
+        let rows = 8;
+        let assets = vec!["a".to_owned(), "b".to_owned()];
+        let mut close = Vec::with_capacity(rows * assets.len());
+        let mut volume = Vec::with_capacity(rows * assets.len());
+        for row in 0..rows {
+            let value = f64::from(u32::try_from(row + 1).unwrap());
+            close.extend([Some(value), Some(-value)]);
+            let alternating = if row % 2 == 0 {
+                value + 1.0
+            } else {
+                value - 1.0
+            };
+            volume.extend([Some(alternating), Some(-alternating)]);
+        }
+        ColumnarDataset {
+            schema: 1,
+            dataset_id: "expanded-operator-semantics-v1".to_owned(),
+            timestamps: (0..rows).map(|row| i64::try_from(row).unwrap()).collect(),
+            assets,
+            fields: BTreeMap::from([
+                ("close".to_owned(), NumericColumn { values: close }),
+                ("volume".to_owned(), NumericColumn { values: volume }),
+            ]),
+            realized_returns: NumericColumn {
+                values: vec![Some(0.0); rows * 2],
+            },
+            groups: BTreeMap::from([(
+                "sector".to_owned(),
+                vec!["one".to_owned(), "one".to_owned()],
+            )]),
+            source_label: "license-safe expanded-operator fixture".to_owned(),
+            preprocessing: vec!["none".to_owned()],
+        }
+    }
+
+    fn raw_signal(expression: &str, dataset: &ColumnarDataset) -> NumericColumn {
+        evaluate_signal(&parse_expression(expression).unwrap(), dataset).unwrap()
+    }
+
+    fn value_at(column: &NumericColumn, row: usize, asset: usize, assets: usize) -> f64 {
+        column.values[row * assets + asset].unwrap()
+    }
+
     fn config() -> EvaluationConfig {
         EvaluationConfig {
             schema: 1,
@@ -1220,6 +1537,117 @@ mod tests {
         assert!((deviation.values[2].unwrap() - 2.0).abs() < 1e-12);
         assert!((standardized.values[2].unwrap() + 1.0).abs() < 1e-12);
         assert!((standardized.values[4].unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn every_generation_enabled_builtin_operator_has_a_numeric_backend() {
+        let unsupported: Vec<_> = builtin_catalog()
+            .operators
+            .iter()
+            .filter(|operator| operator.generation_weight > 0)
+            .filter(|operator| !has_numeric_backend(&operator.name))
+            .map(|operator| operator.name.as_str())
+            .collect();
+        assert!(
+            unsupported.is_empty(),
+            "missing numeric backends: {unsupported:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_evaluator_rejects_generation_enabled_custom_operator_without_backend() {
+        let dataset = fixture();
+        let mut catalog = builtin_catalog().clone();
+        let mut unsupported = catalog.operators[0].clone();
+        unsupported.name = "unsupported_numeric_operator".to_owned();
+        catalog.operators.push(unsupported);
+        catalog.validate().unwrap();
+        let Err(error) = NumericEvaluator::new_with_catalog(&dataset, config(), &catalog) else {
+            panic!("unsupported generation-enabled operator was accepted");
+        };
+        assert!(error.to_string().contains("unsupported_numeric_operator"));
+    }
+
+    #[test]
+    fn expanded_operators_match_pinned_alphagen_window_semantics() {
+        let dataset = expanded_operator_fixture();
+        let expressions = [
+            "abs(close)",
+            "sign(close)",
+            "ts_delay(close, 2)",
+            "ts_sum(close, 3)",
+            "ts_var(close, 3)",
+            "ts_skew(close, 3)",
+            "ts_kurt(close, 3)",
+            "ts_min(close, 3)",
+            "ts_max(close, 3)",
+            "ts_median(close, 3)",
+            "ts_mad(close, 3)",
+            "ts_wma(close, 3)",
+            "ts_ema(close, 3)",
+            "ts_cov(close, volume, 3)",
+            "ts_corr(close, volume, 3)",
+        ];
+        for expression in expressions {
+            let signal = raw_signal(expression, &dataset);
+            assert!(
+                signal.values.iter().any(Option::is_some),
+                "{expression} produced no finite observation"
+            );
+        }
+
+        let at = |expression| value_at(&raw_signal(expression, &dataset), 2, 0, 2);
+        assert!((at("abs(close)") - 3.0).abs() < 1e-12);
+        assert!((at("sign(close)") - 1.0).abs() < 1e-12);
+        assert!(
+            (value_at(&raw_signal("ts_delay(close, 2)", &dataset), 3, 0, 2) - 2.0).abs() < 1e-12
+        );
+        assert!((at("ts_sum(close, 3)") - 6.0).abs() < 1e-12);
+        assert!((at("ts_var(close, 3)") - 1.0).abs() < 1e-12);
+        assert!(at("ts_skew(close, 3)").abs() < 1e-12);
+        assert!((at("ts_kurt(close, 3)") - (-7.0 / 3.0)).abs() < 1e-12);
+        assert!((at("ts_min(close, 3)") - 1.0).abs() < 1e-12);
+        assert!((at("ts_max(close, 3)") - 3.0).abs() < 1e-12);
+        assert!((at("ts_median(close, 3)") - 2.0).abs() < 1e-12);
+        assert!((at("ts_mad(close, 3)") - 2.0 / 3.0).abs() < 1e-12);
+        assert!((at("ts_wma(close, 3)") - 8.0 / 3.0).abs() < 1e-12);
+        assert!((at("ts_ema(close, 3)") - 17.0 / 7.0).abs() < 1e-12);
+        assert!((at("ts_cov(close, volume, 3)") - 1.0).abs() < 1e-12);
+        assert!((at("ts_corr(close, volume, 3)") - 0.654_653_670_707_977_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn expanded_rolling_operators_propagate_missing_windows_and_remain_causal() {
+        let dataset = expanded_operator_fixture();
+        let expressions = [
+            "ts_sum(close, 3)",
+            "ts_var(close, 3)",
+            "ts_skew(close, 3)",
+            "ts_kurt(close, 3)",
+            "ts_min(close, 3)",
+            "ts_max(close, 3)",
+            "ts_median(close, 3)",
+            "ts_mad(close, 3)",
+            "ts_wma(close, 3)",
+            "ts_ema(close, 3)",
+            "ts_cov(close, volume, 3)",
+            "ts_corr(close, volume, 3)",
+        ];
+        let mut future_changed = dataset.clone();
+        future_changed.fields.get_mut("close").unwrap().values[12] = Some(1_000_000.0);
+        future_changed.fields.get_mut("volume").unwrap().values[12] = Some(-1_000_000.0);
+        for expression in expressions {
+            let before = raw_signal(expression, &dataset);
+            let after = raw_signal(expression, &future_changed);
+            assert_eq!(&before.values[..12], &after.values[..12], "{expression}");
+        }
+
+        let mut missing = dataset.clone();
+        missing.fields.get_mut("close").unwrap().values[2] = None;
+        for expression in expressions {
+            let result = raw_signal(expression, &missing);
+            assert_eq!(result.values[4], None, "{expression}");
+        }
     }
 
     #[test]

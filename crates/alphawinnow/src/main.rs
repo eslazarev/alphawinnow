@@ -1,15 +1,16 @@
-use std::{path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use alphawinnow::{
-    Catalog, DialectSpec, FeedbackConfig, FeedbackDataset, Limits, ResourceLimits,
-    SEARCH_SPEC_SCHEMA, SearchRunOptions, SearchSpec, StructuralScoreConfig, analyze_expression,
-    audit_feedback, canonical, compile_dialect, deduplicate, fingerprint, parse_expression,
-    prioritize_candidates, read_candidates, run_search, run_search_with_options,
-    run_search_with_options_and_catalog, write_guided_jsonl_atomic, write_jsonl_atomic,
-    write_run_transactional,
+    Catalog, CatalogScaffoldPolicy, DialectSpec, FeedbackConfig, FeedbackDataset, Limits,
+    OperatorPolicyConfig, ResourceLimits, SEARCH_SPEC_SCHEMA, SearchGuidance, SearchRunOptions,
+    SearchSpec, StructuralScoreConfig, analyze_expression, audit_feedback, builtin_catalog,
+    canonical, compile_dialect, deduplicate, fingerprint, parse_expression,
+    parse_expression_with_catalog, prioritize_candidates, read_candidates, run_search,
+    run_search_with_options, run_search_with_options_and_catalog, write_guided_jsonl_atomic,
+    write_jsonl_atomic, write_run_transactional,
 };
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
 #[cfg(feature = "numeric-evidence")]
@@ -69,6 +70,9 @@ struct DoctorArgs {
 
 #[derive(Debug, Args)]
 struct InspectArgs {
+    /// Optional schema-1 public catalog controlling fields and signatures.
+    #[arg(long)]
+    catalog: Option<PathBuf>,
     /// Expression to parse and validate.
     expression: String,
 }
@@ -91,6 +95,30 @@ struct SearchArgs {
     /// Optional measured-candidate archive in versioned JSONL format.
     #[arg(long)]
     archive: Option<PathBuf>,
+    /// Seed the first parent population from the accepted archive records.
+    #[arg(long, requires = "archive")]
+    seed_from_archive: bool,
+    /// Keep the initial guided archive parent pool fixed across generations.
+    #[arg(long, requires_all = ["archive", "feedback", "seed_from_archive"])]
+    freeze_seed_parents: bool,
+    /// Use a balanced seed-keyed initial cover from the wider typed catalog scaffold.
+    #[arg(long, conflicts_with = "catalog_scaffold_policy")]
+    seeded_catalog_scaffold: bool,
+    /// Select the initial catalog-cover policy; the legacy seeded flag remains supported.
+    #[arg(long, value_enum, default_value_t = CliCatalogScaffoldPolicy::Fixed)]
+    catalog_scaffold_policy: CliCatalogScaffoldPolicy,
+    /// Immutable schema-1 measured feedback used for parent selection.
+    #[arg(long)]
+    feedback: Option<PathBuf>,
+    /// Maximum nearest neighbors used for search guidance.
+    #[arg(long, default_value_t = 8)]
+    feedback_neighbors: usize,
+    /// Minimum comparable neighbors required to guide one candidate.
+    #[arg(long, default_value_t = 3)]
+    feedback_minimum_neighbors: usize,
+    /// Maximum normalized feedback distance in [0, 1].
+    #[arg(long, default_value_t = 0.75)]
+    feedback_maximum_distance: f64,
     /// Destination for shortlisted candidates in versioned JSONL format.
     #[arg(long)]
     output: PathBuf,
@@ -118,6 +146,33 @@ struct SearchArgs {
     /// Maximum operator count per expression.
     #[arg(long, default_value_t = 16)]
     max_operators: usize,
+    /// Maximum resident candidates retained between generations.
+    #[arg(long, default_value_t = 512)]
+    population_capacity: usize,
+    /// Highest-ranked resident candidates eligible to become parents.
+    #[arg(long, default_value_t = 128)]
+    parent_pool_capacity: usize,
+    /// Reserve this many parent slots for the global measured-feedback ranking.
+    #[arg(long, default_value_t = 0, requires = "feedback")]
+    feedback_elite_parent_count: usize,
+    /// Opt in to feedback-derived operator generation weights with this strength in [0, 1].
+    #[arg(long, requires = "feedback")]
+    feedback_operator_policy_strength: Option<f64>,
+    /// Minimum multiplier preserving exploration for every enabled operator.
+    #[arg(long, default_value_t = 0.5)]
+    feedback_operator_exploration_floor: f64,
+    /// Maximum feedback-derived operator-weight multiplier.
+    #[arg(long, default_value_t = 1.5)]
+    feedback_operator_maximum_multiplier: f64,
+    /// Minimum measured records containing an operator before its weight may change.
+    #[arg(long, default_value_t = 3)]
+    feedback_operator_minimum_support: usize,
+    /// Integer scale retaining deterministic fractional weight resolution.
+    #[arg(long, default_value_t = 100)]
+    feedback_operator_weight_scale: u16,
+    /// Optional immutable candidate archive used only to estimate transform-action rewards.
+    #[arg(long, requires = "feedback_operator_policy_strength")]
+    feedback_action_archive: Option<PathBuf>,
     /// Durable checkpoint updated after each completed generation.
     #[arg(long)]
     checkpoint: Option<PathBuf>,
@@ -127,6 +182,24 @@ struct SearchArgs {
     /// Gracefully pause after this many completed generations.
     #[arg(long, hide = true)]
     pause_after_generations: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy, ValueEnum)]
+enum CliCatalogScaffoldPolicy {
+    #[default]
+    Fixed,
+    SeededDiverse,
+    MotifDiverse,
+}
+
+impl From<CliCatalogScaffoldPolicy> for CatalogScaffoldPolicy {
+    fn from(value: CliCatalogScaffoldPolicy) -> Self {
+        match value {
+            CliCatalogScaffoldPolicy::Fixed => Self::Fixed,
+            CliCatalogScaffoldPolicy::SeededDiverse => Self::SeededDiverse,
+            CliCatalogScaffoldPolicy::MotifDiverse => Self::MotifDiverse,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +213,12 @@ struct BenchmarkArgs {
     /// Workload seed.
     #[arg(long, default_value_t = 20260828)]
     seed: u64,
+    /// Optional comma-separated seeds; when supplied, replaces --seed.
+    #[arg(long, value_delimiter = ',')]
+    seeds: Option<Vec<u64>>,
+    /// Repetitions for every seed/thread pair.
+    #[arg(long, default_value_t = 1)]
+    repetitions: usize,
 }
 
 #[derive(Debug, Args)]
@@ -685,12 +764,22 @@ fn doctor(args: &DoctorArgs) {
 }
 
 fn inspect(args: &InspectArgs) -> Result<()> {
-    let expression = parse_expression(&args.expression).context("invalid expression")?;
+    let catalog = load_optional_catalog(args.catalog.as_ref())?;
+    let expression = if let Some(catalog) = &catalog {
+        parse_expression_with_catalog(&args.expression, catalog)
+    } else {
+        parse_expression(&args.expression)
+    }
+    .context("invalid expression")?;
+    let operator_catalog_checksum = catalog
+        .as_ref()
+        .map_or_else(|| builtin_catalog().checksum(), Catalog::checksum);
     let analysis = analyze_expression(&expression);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "schema": 1,
+            "operator_catalog_checksum": operator_catalog_checksum,
             "kind": expression.kind(),
             "canonical": canonical(&expression),
             "semantic_canonical": analysis.semantic_canonical,
@@ -742,10 +831,40 @@ fn search(args: &SearchArgs) -> Result<()> {
     }
     let spec = search_spec(args);
     spec.validate().context("invalid search configuration")?;
+    let guidance = args
+        .feedback
+        .as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("cannot read feedback {}", path.display()))?;
+            let dataset: FeedbackDataset =
+                serde_json::from_slice(&bytes).context("invalid measured-feedback JSON")?;
+            Ok::<_, anyhow::Error>(SearchGuidance {
+                dataset,
+                config: FeedbackConfig {
+                    schema: 1,
+                    neighbors: args.feedback_neighbors,
+                    minimum_neighbors: args.feedback_minimum_neighbors,
+                    maximum_distance: args.feedback_maximum_distance,
+                },
+            })
+        })
+        .transpose()?;
     let options = SearchRunOptions {
         checkpoint_path: args.checkpoint.clone().or_else(|| args.resume_from.clone()),
         resume_from: args.resume_from.clone(),
         pause_after_generations: args.pause_after_generations,
+        guidance,
+        seed_from_archive: args.seed_from_archive,
+        freeze_seed_parents: args.freeze_seed_parents,
+        feedback_elite_parent_count: args.feedback_elite_parent_count,
+        operator_policy: operator_policy_config(args),
+        operator_policy_action_archive: args.feedback_action_archive.clone(),
+        catalog_scaffold_policy: if args.seeded_catalog_scaffold {
+            CatalogScaffoldPolicy::SeededDiverse
+        } else {
+            args.catalog_scaffold_policy.into()
+        },
     };
     let catalog = args
         .catalog
@@ -788,13 +907,30 @@ fn search(args: &SearchArgs) -> Result<()> {
             "archive_rejection_reasons": result.manifest.archive_rejection_reasons,
             "accepted_transform_counts": result.manifest.accepted_transform_counts,
             "retained_transform_counts": result.manifest.retained_transform_counts,
+            "measured_feedback": result.manifest.measured_feedback,
+            "operator_policy": result.manifest.operator_policy,
+            "guided_population_candidates": result.manifest.guided_population_candidates,
+            "seeded_from_archive": result.manifest.seeded_from_archive,
+            "frozen_seed_parents": result.manifest.frozen_seed_parents,
+            "feedback_elite_parent_count": result.manifest.feedback_elite_parent_count,
             "content_checksum": checksum,
         })
     );
     Ok(())
 }
 
-#[cfg(feature = "numeric-evidence")]
+fn operator_policy_config(args: &SearchArgs) -> Option<OperatorPolicyConfig> {
+    args.feedback_operator_policy_strength
+        .map(|strength| OperatorPolicyConfig {
+            schema: 1,
+            strength,
+            exploration_floor: args.feedback_operator_exploration_floor,
+            maximum_multiplier: args.feedback_operator_maximum_multiplier,
+            minimum_support: args.feedback_operator_minimum_support,
+            weight_scale: args.feedback_operator_weight_scale,
+        })
+}
+
 fn load_optional_catalog(path: Option<&PathBuf>) -> Result<Option<Catalog>> {
     path.map(|path| {
         let content = std::fs::read_to_string(path)
@@ -806,58 +942,146 @@ fn load_optional_catalog(path: Option<&PathBuf>) -> Result<Option<Catalog>> {
 }
 
 fn benchmark(args: &BenchmarkArgs) -> Result<()> {
-    if args.threads.is_empty() || args.threads.contains(&0) || args.candidates == 0 {
-        bail!("benchmark candidates and thread counts must be greater than zero");
+    if args.threads.is_empty()
+        || args.threads.contains(&0)
+        || args.candidates == 0
+        || args.repetitions == 0
+    {
+        bail!("benchmark candidates, thread counts, and repetitions must be greater than zero");
     }
+    let seeds = args.seeds.clone().unwrap_or_else(|| vec![args.seed]);
+    if seeds.is_empty() {
+        bail!("benchmark seeds must not be empty");
+    }
+
     let mut trials = Vec::new();
-    for &threads in &args.threads {
-        let spec = SearchSpec {
-            schema: SEARCH_SPEC_SCHEMA,
-            seed: args.seed,
-            threads,
-            max_candidates: args.candidates,
-            duration_seconds: 3_600,
-            limits: Limits::default(),
-            scoring: StructuralScoreConfig::default(),
-            shortlist_size: 100,
-            resources: ResourceLimits::default(),
-        };
-        let started = Instant::now();
-        let result = run_search(&spec, None).context("benchmark workload failed")?;
-        trials.push(json!({
-            "threads": threads,
-            "generated_candidates": result.manifest.attempted_candidates,
-            "attempted_candidates": result.manifest.attempted_candidates,
-            "rejected_invalid_candidates": result.manifest.rejected_invalid_candidates,
-            "semantic_families": result.manifest.valid_candidates,
-            "valid_candidates": result.manifest.valid_candidates,
-            "rejected_trivial_candidates": result.manifest.rejected_trivial_candidates,
-            "rejection_reasons": result.manifest.rejection_reasons,
-            "rejected_duplicate_candidates": result.manifest.duplicate_candidates,
-            "evaluated_candidates": result.manifest.valid_candidates,
-            "archived_candidates": result.manifest.valid_candidates,
-            "generations_completed": result.manifest.generations_completed,
-            "population_capacity": result.manifest.population_capacity,
-            "peak_population": result.manifest.peak_population,
-            "accepted_transform_counts": result.manifest.accepted_transform_counts,
-            "retained_transform_counts": result.manifest.retained_transform_counts,
-            "retained_candidates": result.manifest.retained_candidates,
-            "candidate_checksum": result.manifest.candidate_content_checksum,
-            "wall_milliseconds": started.elapsed().as_millis(),
-            "configuration": spec,
-        }));
+    let mut expected_checksums = BTreeMap::new();
+    let mut zero_invalid_emissions = true;
+    let mut bounded_populations = true;
+    let mut duplicate_rejection_observed = true;
+    for &seed in &seeds {
+        for repetition in 0..args.repetitions {
+            for &threads in &args.threads {
+                let trial = benchmark_trial(seed, repetition + 1, threads, args.candidates)?;
+                zero_invalid_emissions &= trial.zero_invalid_emissions;
+                bounded_populations &= trial.bounded_population;
+                duplicate_rejection_observed &= trial.duplicate_rejection_observed;
+                if let Some(expected) = expected_checksums.insert(seed, trial.checksum.clone())
+                    && expected != trial.checksum
+                {
+                    bail!(
+                        "determinism failure for seed {seed}: expected {expected}, got {}",
+                        trial.checksum
+                    );
+                }
+                trials.push(trial.payload);
+            }
+        }
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "schema": 1,
             "workload": "deterministic_structural_search",
-            "seed": args.seed,
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "environment": {
+                "architecture": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+            },
+            "seed": (seeds.len() == 1).then_some(seeds[0]),
+            "seeds": seeds,
+            "repetitions": args.repetitions,
             "candidate_ceiling": args.candidates,
+            "deterministic_across_repetitions_and_thread_counts": true,
+            "engineering_checks": {
+                "zero_invalid_emissions": zero_invalid_emissions,
+                "bounded_populations": bounded_populations,
+                "duplicate_rejection_observed": duplicate_rejection_observed,
+            },
             "trials": trials,
         }))?
     );
     Ok(())
+}
+
+struct BenchmarkTrial {
+    payload: serde_json::Value,
+    checksum: String,
+    zero_invalid_emissions: bool,
+    bounded_population: bool,
+    duplicate_rejection_observed: bool,
+}
+
+fn benchmark_trial(
+    seed: u64,
+    repetition: usize,
+    threads: usize,
+    candidates: u64,
+) -> Result<BenchmarkTrial> {
+    let spec = SearchSpec {
+        schema: SEARCH_SPEC_SCHEMA,
+        seed,
+        threads,
+        max_candidates: candidates,
+        duration_seconds: 3_600,
+        limits: Limits::default(),
+        scoring: StructuralScoreConfig::default(),
+        shortlist_size: 100,
+        resources: ResourceLimits::default(),
+    };
+    let started = Instant::now();
+    let result = run_search(&spec, None).context("benchmark workload failed")?;
+    let elapsed = started.elapsed();
+    let manifest = result.manifest;
+    let attempted_float = benchmark_count_as_f64(manifest.attempted_candidates)?;
+    let invalid_float = benchmark_count_as_f64(manifest.rejected_invalid_candidates)?;
+    let valid_float = benchmark_count_as_f64(manifest.valid_candidates)?;
+    let trivial_float = benchmark_count_as_f64(manifest.rejected_trivial_candidates)?;
+    let duplicate_float = benchmark_count_as_f64(manifest.duplicate_candidates)?;
+    let checksum = manifest.candidate_content_checksum.clone();
+    let trial = BenchmarkTrial {
+        checksum: checksum.clone(),
+        zero_invalid_emissions: manifest.rejected_invalid_candidates == 0,
+        bounded_population: manifest.peak_population <= manifest.population_capacity,
+        duplicate_rejection_observed: manifest.duplicate_candidates > 0,
+        payload: json!({
+            "seed": seed,
+            "repetition": repetition,
+            "threads": threads,
+            "generated_candidates": manifest.attempted_candidates,
+            "attempted_candidates": manifest.attempted_candidates,
+            "rejected_invalid_candidates": manifest.rejected_invalid_candidates,
+            "invalid_rate": invalid_float / attempted_float,
+            "semantic_families": manifest.valid_candidates,
+            "valid_candidates": manifest.valid_candidates,
+            "semantic_family_yield": valid_float / attempted_float,
+            "rejected_trivial_candidates": manifest.rejected_trivial_candidates,
+            "trivial_rate": trivial_float / attempted_float,
+            "rejection_reasons": manifest.rejection_reasons,
+            "rejected_duplicate_candidates": manifest.duplicate_candidates,
+            "duplicate_rate": duplicate_float / attempted_float,
+            "evaluated_candidates": manifest.valid_candidates,
+            "archived_candidates": manifest.valid_candidates,
+            "generations_completed": manifest.generations_completed,
+            "population_capacity": manifest.population_capacity,
+            "peak_population": manifest.peak_population,
+            "accepted_transform_counts": manifest.accepted_transform_counts,
+            "retained_transform_counts": manifest.retained_transform_counts,
+            "retained_candidates": manifest.retained_candidates,
+            "candidate_checksum": checksum,
+            "wall_milliseconds": elapsed.as_millis(),
+            "attempted_candidates_per_second": attempted_float / elapsed.as_secs_f64(),
+            "semantic_families_per_second": valid_float / elapsed.as_secs_f64(),
+            "configuration": spec,
+        }),
+    };
+    Ok(trial)
+}
+
+fn benchmark_count_as_f64(count: u64) -> Result<f64> {
+    u32::try_from(count)
+        .map(f64::from)
+        .context("benchmark count exceeds the supported candidate ceiling")
 }
 
 fn search_spec(args: &SearchArgs) -> SearchSpec {
@@ -866,6 +1090,11 @@ fn search_spec(args: &SearchArgs) -> SearchSpec {
         max_nodes: args.max_nodes,
         max_operators: args.max_operators,
         ..Limits::default()
+    };
+    let resources = ResourceLimits {
+        population_capacity: args.population_capacity,
+        parent_pool_capacity: args.parent_pool_capacity,
+        ..ResourceLimits::default()
     };
     SearchSpec {
         schema: SEARCH_SPEC_SCHEMA,
@@ -876,7 +1105,7 @@ fn search_spec(args: &SearchArgs) -> SearchSpec {
         limits,
         scoring: StructuralScoreConfig::default(),
         shortlist_size: args.shortlist_size,
-        resources: ResourceLimits::default(),
+        resources,
     }
 }
 

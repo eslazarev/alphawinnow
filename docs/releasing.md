@@ -2,9 +2,10 @@
 
 A release publishes the `alphawinnow` crate to crates.io and attaches
 prebuilt `alphawinnow` binaries to a GitHub Release. Merging to `main` triggers
-it; the version is raised, tagged, verified, and published by
+it; the tree is verified, the version resolved, then tagged and published by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) in one run.
-No version is edited and nothing is uploaded from a workstation.
+A reviewed PR may prepare the version explicitly. Nothing needs to be uploaded
+from a workstation.
 
 ## One-time repository setup
 
@@ -22,13 +23,48 @@ scheduled audits, and the binary matrix never see it.
 
 ## Cutting a release
 
-Merge to `main`. That is the whole procedure: the workflow raises the version,
-tags it, and releases it in one run. Nothing is edited by hand and no tag is
-pushed from a workstation.
+After review and CI, merge to `main`. The workflow verifies the tree, resolves
+the version, tags it, and releases it in one run. A merge that changes crate
+source or manifests is a publishing action; do not merge just to rehearse.
+
+### Preparing an explicit version
+
+For a planned breaking release such as 0.2.0, update `[workspace.package].version`
+and the `alphawinnow` entry in `Cargo.lock` together in the PR. Add a changelog
+entry and `docs/releases/<version>.md`; the workflow appends these version-specific
+notes to the GitHub release. Keep Homebrew/Scoop manifests unchanged until actual
+release archives and checksums exist.
+
+In `auto` mode, `bump-version.sh` preserves a manifest version greater than the
+last reachable `v*` tag and verifies its lockfile with `cargo metadata --locked`.
+It does not increment a prepared 0.2.0 to 0.2.1, nor create an empty bump commit.
+A version behind the last release fails. Explicit `patch`/`minor`/`major` still
+increment the manifest, so choose `auto` to publish a prepared version.
+
+Before committing, inspect `git diff` and the exact file list: local research
+directories, private datasets, machine-specific handoff notes and result artifacts
+must not be included. Do not use `git add .` on a long-lived research checkout.
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_*.py'
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo test --workspace --no-default-features --locked
+cargo +1.92.0 check --workspace --all-targets --all-features --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+cargo run --example measured_search --no-default-features --locked
+cargo package -p alphawinnow --list --locked
+cargo publish --workspace --dry-run --locked
+```
+
+On a dirty preparation checkout, package/dry-run checks need `--allow-dirty`;
+this does not stage or publish anything. Review the packaged sources separately.
 
 ### Which part of the version moves
 
-`scripts/bump-version.sh` classifies the Conventional Commit subjects since the
+When no newer version is already prepared, `scripts/bump-version.sh` classifies
+the Conventional Commit subjects since the
 last `v*` tag: a `!` marker or a `BREAKING CHANGE:` trailer is breaking, a
 `feat:` subject is a feature, anything else is a fix.
 
@@ -42,7 +78,8 @@ as one compatibility range and `0.2.0` as a different one:
 | `feat!:` or `BREAKING CHANGE:` | minor | major |
 
 Promoting a breaking change to `major` while below `1.0.0` would claim a
-stability this crate has not declared yet, so the script refuses to.
+stability this crate has not declared yet, so automatic classification uses
+`minor`. A manually requested `major` still takes effect.
 
 ### When a merge does not release
 
@@ -84,9 +121,10 @@ anything is built or uploaded.
    rehearse, or stop. A merge that changed no crate source or manifest stops
    here.
 3. **verify** — formatting, Clippy with warnings denied, the full all-features
-   test suite, and a `cargo publish --workspace --dry-run`. Only after all four
-   pass does the same job raise the version, refresh `Cargo.lock`, commit
-   `chore(release): vX.Y.Z`, and push the commit and the tag. The order is the
+   test suite, version-selection regression tests, and a
+   `cargo publish --workspace --dry-run`. Only after checks pass does the same
+   job resolve the prepared version or raise it and refresh `Cargo.lock`, commit
+   `chore(release): vX.Y.Z` if files changed, and push the commit and tag. The order is the
    point: every check is read-only, so a failure can never leave a tag behind
    on a commit that does not build. The raise step is skipped for a pushed tag,
    which already names its version. Every later job checks out the immutable

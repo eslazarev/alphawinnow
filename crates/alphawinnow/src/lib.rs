@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod dialect;
 pub mod engine;
 pub mod feedback;
+pub mod measured_search;
 pub mod novelty;
 #[cfg(feature = "numeric-evidence")]
 pub mod numeric;
@@ -21,9 +22,10 @@ pub mod tree;
 pub use analysis::{ExpressionAnalysis, RejectionReason, analyze_expression};
 pub use artifact::{
     ArtifactError, CANDIDATE_SCHEMA, CHECKPOINT_SCHEMA, CandidateRecord, CheckpointDraft,
-    MANIFEST_SCHEMA, PublicationPointer, RunCheckpoint, RunManifest, StructuralScoreComponents,
-    publication_pointer_path, read_candidates, read_checkpoint, read_published_run,
-    write_checkpoint_atomic, write_jsonl_atomic, write_manifest_atomic, write_run_transactional,
+    FeedbackProvenance, MANIFEST_SCHEMA, OperatorPolicyProvenance, PublicationPointer,
+    RunCheckpoint, RunManifest, StructuralScoreComponents, publication_pointer_path,
+    read_candidates, read_checkpoint, read_published_run, write_checkpoint_atomic,
+    write_jsonl_atomic, write_manifest_atomic, write_run_transactional,
 };
 pub use ast::{Expr, ExprKind};
 pub use canonical::{canonical, fingerprint, semantic_canonical, semantic_fingerprint};
@@ -35,13 +37,15 @@ pub use dialect::{
     compile_dialect,
 };
 pub use engine::{
-    SearchError, SearchResult, SearchRunOptions, run_search, run_search_with_catalog,
-    run_search_with_options, run_search_with_options_and_catalog,
+    SearchError, SearchGuidance, SearchResult, SearchRunOptions, run_search,
+    run_search_with_catalog, run_search_with_options, run_search_with_options_and_catalog,
 };
 pub use feedback::{
     FEEDBACK_DATASET_SCHEMA, FeedbackAuditReport, FeedbackConfig, FeedbackDataset, FeedbackError,
-    FeedbackRecord, GUIDED_CANDIDATE_SCHEMA, GuidanceEstimate, GuidedCandidate, audit_feedback,
-    candidate_features, prioritize_candidates, write_guided_jsonl_atomic,
+    FeedbackRecord, GUIDED_CANDIDATE_SCHEMA, GuidanceEstimate, GuidedCandidate,
+    OPERATOR_POLICY_SCHEMA, OperatorPolicyConfig, OperatorPolicyReport, audit_feedback,
+    candidate_features, prioritize_candidates, reweight_operator_catalog,
+    write_guided_jsonl_atomic,
 };
 pub use novelty::{
     StructuralDescriptor, common_ancestor_depth, describe, describe_with_catalog,
@@ -63,9 +67,12 @@ pub use parquet_input::{
 };
 pub use parser::{ExpressionError, parse_expression, parse_expression_with_catalog};
 pub use transform::{
-    Limits, MutationClass, Provenance, TransformKind, TransformValidationError, crossover,
-    crossover_with_catalog, crossover_with_paths, generate_with_catalog, mutate,
-    mutate_with_catalog, mutate_with_class, validate_transformed,
+    CATALOG_SCAFFOLD_OPERATION, CatalogScaffoldPolicy, Limits, MOTIF_CATALOG_SCAFFOLD_OPERATION,
+    MutationClass, Provenance, SEEDED_CATALOG_SCAFFOLD_OPERATION, TransformKind,
+    TransformValidationError, crossover, crossover_with_catalog, crossover_with_paths,
+    generate_with_catalog, generate_with_catalog_scaffold_policy, is_catalog_scaffold_operation,
+    mutate, mutate_applicable_with_catalog, mutate_with_catalog, mutate_with_class,
+    mutate_with_class_and_catalog, sample_with_catalog, validate_transformed,
     validate_transformed_with_catalog,
 };
 pub use tree::{

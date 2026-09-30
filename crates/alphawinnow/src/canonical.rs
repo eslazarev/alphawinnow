@@ -92,6 +92,8 @@ mod tests {
             ("add(close, open)", "add(open, close)"),
             ("multiply(close, open)", "multiply(open, 2, close)"),
             ("winsorize(close, std=2.0)", "winsorize(close, std=2)"),
+            ("rank(close)", "rank(rank(close))"),
+            ("rank(close)", "rank(rank(rank(close)))"),
         ];
         for (left, right) in equivalent {
             let left = parse_expression(left).unwrap();
@@ -102,6 +104,11 @@ mod tests {
         let distinct = [
             ("close", "multiply(close, -2)"),
             ("rank(close)", "rank(multiply(close, 2))"),
+            ("rank(close)", "rank(ts_rank(close, 5))"),
+            (
+                "group_rank(close, group(\"sector\"))",
+                "rank(group_rank(close, group(\"sector\")))",
+            ),
             (
                 "clip(close, lower=-2, upper=2)",
                 "clip(multiply(close, 2), upper=2, lower=-2)",
