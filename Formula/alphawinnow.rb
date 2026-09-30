@@ -3,28 +3,28 @@
 class Alphawinnow < Formula
   desc "Typed, deterministic formulaic alpha-mining and factor-evaluation engine"
   homepage "https://github.com/eslazarev/alphawinnow"
-  version "0.1.2"
+  version "0.2.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.1.2/alphawinnow-0.1.2-aarch64-apple-darwin.tar.gz"
-      sha256 "3d781f945c05e9c23bc31b23e8758d7d076755c87f84eb0026ed1c6f60ea186b"
+      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.2.0/alphawinnow-0.2.0-aarch64-apple-darwin.tar.gz"
+      sha256 "d6219060210d9ae131113cc4f82d0a5533fe1a68a32b28c72936a3bd8d9f13e5"
     end
     on_intel do
-      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.1.2/alphawinnow-0.1.2-x86_64-apple-darwin.tar.gz"
-      sha256 "eb61b569980f6017ab5d338b62ecbb3e6eac5f43070319edfb4facf014ad9ed2"
+      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.2.0/alphawinnow-0.2.0-x86_64-apple-darwin.tar.gz"
+      sha256 "e9235688b0996a901a8c3e30bf91a25a9fa7b2a7ee840dc2cdb8ff4fc1d373d4"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.1.2/alphawinnow-0.1.2-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "c316bddeaa0d0d63368f62fc1fd9fa847b0333267d90d24f4a5333a2894d65a6"
+      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.2.0/alphawinnow-0.2.0-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "a37eaed048c5d00b8b5d81c8e2b4ed39d7d1fef697d2e2eca2e134d001404618"
     end
     on_intel do
-      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.1.2/alphawinnow-0.1.2-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "eb813d1522b131f16a0c9895c41efec935cda90c51099d8b2acd41e31fc7f88f"
+      url "https://github.com/eslazarev/alphawinnow/releases/download/v0.2.0/alphawinnow-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "ba29d1f1a05c8141e2dc8964dbc280b0ccbc0116f3f1e1653bf8eda26e316f6f"
     end
   end
 
