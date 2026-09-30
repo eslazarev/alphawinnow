@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -6,14 +6,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    analysis::analyze_expression,
     ast::{Expr, ExprKind},
-    canonical::{canonical, fingerprint, semantic_fingerprint},
+    canonical::{canonical, digest, fingerprint, semantic_fingerprint},
     operators::{self, Arity, OperatorSpec, ValueDomain},
     parser::parse_expression_with_catalog,
     tree::{ExprPath, PathEntry, PathSegment, enumerate_paths, replace_subtree, subtree_at},
 };
 
 const RETRY_BUDGET: u32 = 16;
+const MAX_CATALOG_SCAFFOLDS: usize = 64;
+const MAX_CATALOG_SCAFFOLD_UNIVERSE: usize = 4_096;
 const MAX_CONFIGURED_DEPTH: usize = 64;
 const MAX_CONFIGURED_NODES: usize = 4_096;
 const MAX_CONFIGURED_OPERATORS: usize = 2_048;
@@ -85,7 +88,14 @@ impl Limits {
 
 fn parameter_bounds(expression: &Expr, limits: &Limits, catalog: &operators::Catalog) -> bool {
     match expression {
-        Expr::Scalar { value } => value.abs() <= f64::from(limits.max_scalar_abs),
+        Expr::Scalar { value } => {
+            let domain = &catalog.scalar_domain;
+            let offset = (value - domain.min) / domain.step;
+            value.is_finite()
+                && value.abs() <= f64::from(limits.max_scalar_abs)
+                && (domain.min..=domain.max).contains(value)
+                && (offset - offset.round()).abs() <= 1e-8
+        }
         Expr::UnaryCall {
             op, arg, kwargs, ..
         } => call_parameters_in_bounds(op, &[arg.as_ref()], kwargs, limits, catalog),
@@ -127,20 +137,21 @@ fn call_parameters_in_bounds(
     };
     args.iter().enumerate().all(|(index, argument)| {
         let argument = *argument;
-        if !parameter_bounds(argument, limits, catalog) {
-            return false;
-        }
         match operator_input(spec, index).map(|input| &input.domain) {
             Some(ValueDomain::Window { .. } | ValueDomain::WindowSet { .. }) => {
                 matches!(argument, Expr::Scalar { value }
                 if value.fract() == 0.0
                 && (f64::from(limits.min_window)..=f64::from(limits.max_window)).contains(value))
             }
-            _ => true,
+            _ => parameter_bounds(argument, limits, catalog),
         }
     }) && kwargs
         .values()
-        .all(|value| parameter_bounds(value, limits, catalog))
+        // Keyword domains are checked by the parser, not scalar_domain.
+        .all(|value| {
+            matches!(value, Expr::Scalar { value }
+            if value.is_finite() && value.abs() <= f64::from(limits.max_scalar_abs))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -194,6 +205,37 @@ pub enum TransformKind {
     FallbackGeneration,
 }
 
+/// Auditable provenance label for the deterministic, data-independent grammar cover.
+pub const CATALOG_SCAFFOLD_OPERATION: &str = "catalog_scaffold";
+/// Auditable provenance label for the seed-diverse, data-independent grammar cover.
+pub const SEEDED_CATALOG_SCAFFOLD_OPERATION: &str = "seeded_catalog_scaffold";
+/// Auditable provenance label for the seed-diverse quantitative-motif cover.
+pub const MOTIF_CATALOG_SCAFFOLD_OPERATION: &str = "motif_catalog_scaffold";
+
+/// Policy controlling the initial data-independent catalog cover.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogScaffoldPolicy {
+    /// Preserve the historical fixed 64-expression cover.
+    #[default]
+    Fixed,
+    /// Select a balanced, seed-keyed cover from a wider typed scaffold universe.
+    SeededDiverse,
+    /// Preserve broad root coverage, then reserve capacity for typed quantitative motifs.
+    MotifDiverse,
+}
+
+/// Return whether a provenance operation belongs to either catalog-cover policy.
+#[must_use]
+pub fn is_catalog_scaffold_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        CATALOG_SCAFFOLD_OPERATION
+            | SEEDED_CATALOG_SCAFFOLD_OPERATION
+            | MOTIF_CATALOG_SCAFFOLD_OPERATION
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationClass {
@@ -208,7 +250,7 @@ pub enum MutationClass {
 }
 
 impl MutationClass {
-    const ALL: [Self; 8] = [
+    pub const ALL: [Self; 8] = [
         Self::Field,
         Self::Window,
         Self::Scalar,
@@ -219,7 +261,8 @@ impl MutationClass {
         Self::Subtree,
     ];
 
-    const fn operation(self) -> &'static str {
+    #[must_use]
+    pub const fn operation(self) -> &'static str {
         match self {
             Self::Field => "mutate_field",
             Self::Window => "mutate_window",
@@ -264,6 +307,63 @@ pub fn generate_with_catalog(
     limits: &Limits,
     catalog: &operators::Catalog,
 ) -> (Expr, Provenance) {
+    generate_with_catalog_scaffold_policy(
+        seed,
+        index,
+        limits,
+        catalog,
+        CatalogScaffoldPolicy::Fixed,
+    )
+}
+
+/// Deterministically generate with an explicit catalog-cover policy.
+#[must_use]
+pub fn generate_with_catalog_scaffold_policy(
+    seed: u64,
+    index: u64,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+    scaffold_policy: CatalogScaffoldPolicy,
+) -> (Expr, Provenance) {
+    let scaffolds = match scaffold_policy {
+        CatalogScaffoldPolicy::Fixed => catalog_scaffolds(limits, catalog),
+        CatalogScaffoldPolicy::SeededDiverse => seeded_catalog_scaffolds(seed, limits, catalog),
+        CatalogScaffoldPolicy::MotifDiverse => motif_catalog_scaffolds(seed, limits, catalog),
+    };
+    if let Some(expression) = scaffolds
+        .get(usize::try_from(index).unwrap_or(usize::MAX))
+        .cloned()
+    {
+        let provenance = Provenance {
+            kind: TransformKind::Initial,
+            operation: match scaffold_policy {
+                CatalogScaffoldPolicy::Fixed => CATALOG_SCAFFOLD_OPERATION,
+                CatalogScaffoldPolicy::SeededDiverse => SEEDED_CATALOG_SCAFFOLD_OPERATION,
+                CatalogScaffoldPolicy::MotifDiverse => MOTIF_CATALOG_SCAFFOLD_OPERATION,
+            }
+            .to_owned(),
+            parent_fingerprints: Vec::new(),
+            requested_operation: None,
+            affected_path: None,
+            old_subtree_fingerprint: None,
+            new_subtree_fingerprint: Some(fingerprint(&expression)),
+            retry_count: 0,
+        };
+        return (expression, provenance);
+    }
+    sample_with_catalog(seed, index, limits, catalog)
+}
+
+/// Sample the typed grammar directly, without a fixed or seeded scaffold prefix.
+/// Identical seed, index, limits and catalog produce identical results.
+/// Sampling follows the catalog's generation weights; it is not uniform over trees.
+#[must_use]
+pub fn sample_with_catalog(
+    seed: u64,
+    index: u64,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> (Expr, Provenance) {
     let mut rng = seeded(seed, index, 0x9e37_79b9_7f4a_7c15);
     let expression = fresh_signal(&mut rng, None, limits, catalog);
     let provenance = Provenance {
@@ -277,6 +377,614 @@ pub fn generate_with_catalog(
         retry_count: 0,
     };
     (expression, provenance)
+}
+
+fn catalog_scaffolds(limits: &Limits, catalog: &operators::Catalog) -> Vec<Expr> {
+    catalog_scaffold_universe(limits, catalog)
+        .into_iter()
+        .take(MAX_CATALOG_SCAFFOLDS)
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn catalog_scaffold_universe(limits: &Limits, catalog: &operators::Catalog) -> Vec<Expr> {
+    let fields = catalog
+        .fields
+        .iter()
+        .map(|field| Expr::Field {
+            name: field.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(MAX_CATALOG_SCAFFOLDS);
+    let mut seen = BTreeSet::new();
+    let mut push = |candidate: Expr| {
+        if result.len() >= MAX_CATALOG_SCAFFOLD_UNIVERSE
+            || validate_transformed_with_catalog(&candidate, limits, catalog).is_err()
+        {
+            return;
+        }
+        let identity = semantic_fingerprint(&candidate);
+        if seen.insert(identity) {
+            result.push(candidate);
+        }
+    };
+
+    for field in &fields {
+        push(field.clone());
+    }
+    for operator in ["multiply", "add"] {
+        if catalog
+            .lookup(operator)
+            .is_none_or(|spec| spec.generation_weight == 0)
+        {
+            continue;
+        }
+        for left in 0..fields.len() {
+            let first_right = if operator == "add" { left + 1 } else { left };
+            for right in first_right..fields.len() {
+                if let Ok(candidate) = operators::build_call_with_catalog(
+                    catalog,
+                    operator,
+                    vec![fields[left].clone(), fields[right].clone()],
+                    BTreeMap::new(),
+                ) {
+                    push(candidate);
+                }
+            }
+        }
+    }
+    if catalog
+        .lookup("subtract")
+        .is_some_and(|spec| spec.generation_weight > 0)
+    {
+        for left in 0..fields.len() {
+            for right in left + 1..fields.len() {
+                for (first, second) in [(left, right), (right, left)] {
+                    if let Ok(candidate) = operators::build_call_with_catalog(
+                        catalog,
+                        "subtract",
+                        vec![fields[first].clone(), fields[second].clone()],
+                        BTreeMap::new(),
+                    ) {
+                        push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    let unary_inputs = seeded_scaffold_unary_inputs(&fields, limits, catalog);
+    for spec in catalog
+        .operators
+        .iter()
+        .filter(|spec| spec.generation_weight > 0 && spec.output == ExprKind::Signal)
+    {
+        match spec.arity {
+            Arity::Unary
+                if spec.inputs.len() == 1
+                    && spec.inputs[0].kinds.contains(&ExprKind::Signal)
+                    && matches!(spec.inputs[0].domain, ValueDomain::Any) =>
+            {
+                for input in &unary_inputs {
+                    if let Ok(candidate) = operators::build_call_with_catalog(
+                        catalog,
+                        &spec.name,
+                        vec![input.clone()],
+                        BTreeMap::new(),
+                    ) {
+                        push(candidate);
+                    }
+                }
+            }
+            Arity::Binary
+                if spec.inputs.len() == 2
+                    && spec.inputs[0].kinds.contains(&ExprKind::Signal)
+                    && spec.inputs[1].kinds.contains(&ExprKind::Signal)
+                    && matches!(spec.inputs[0].domain, ValueDomain::Any)
+                    && matches!(spec.inputs[1].domain, ValueDomain::Any) =>
+            {
+                for left in 0..fields.len() {
+                    let first_right = if spec.commutative { left } else { 0 };
+                    for right in first_right..fields.len() {
+                        if let Ok(candidate) = operators::build_call_with_catalog(
+                            catalog,
+                            &spec.name,
+                            vec![fields[left].clone(), fields[right].clone()],
+                            BTreeMap::new(),
+                        ) {
+                            push(candidate);
+                        }
+                    }
+                }
+            }
+            Arity::Binary
+                if spec.inputs.len() == 2
+                    && spec.inputs[0].kinds.contains(&ExprKind::Signal)
+                    && matches!(spec.inputs[0].domain, ValueDomain::Any)
+                    && matches!(
+                        spec.inputs[1].domain,
+                        ValueDomain::Window { .. } | ValueDomain::WindowSet { .. }
+                    ) =>
+            {
+                for field in &fields {
+                    for window in scaffold_windows(&spec.inputs[1].domain, limits) {
+                        if let Ok(candidate) = operators::build_call_with_catalog(
+                            catalog,
+                            &spec.name,
+                            vec![
+                                field.clone(),
+                                Expr::Scalar {
+                                    value: f64::from(window),
+                                },
+                            ],
+                            BTreeMap::new(),
+                        ) {
+                            push(candidate);
+                        }
+                    }
+                }
+            }
+            Arity::Exact { count: 3 }
+                if spec.inputs.len() == 3
+                    && spec.inputs[0].kinds.contains(&ExprKind::Signal)
+                    && spec.inputs[1].kinds.contains(&ExprKind::Signal)
+                    && matches!(spec.inputs[0].domain, ValueDomain::Any)
+                    && matches!(spec.inputs[1].domain, ValueDomain::Any)
+                    && matches!(
+                        spec.inputs[2].domain,
+                        ValueDomain::Window { .. } | ValueDomain::WindowSet { .. }
+                    ) =>
+            {
+                for left in 0..fields.len() {
+                    let first_right = if spec.commutative { left } else { 0 };
+                    for right in first_right..fields.len() {
+                        for window in scaffold_windows(&spec.inputs[2].domain, limits) {
+                            if let Ok(candidate) = operators::build_call_with_catalog(
+                                catalog,
+                                &spec.name,
+                                vec![
+                                    fields[left].clone(),
+                                    fields[right].clone(),
+                                    Expr::Scalar {
+                                        value: f64::from(window),
+                                    },
+                                ],
+                                BTreeMap::new(),
+                            ) {
+                                push(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+fn seeded_scaffold_unary_inputs(
+    fields: &[Expr],
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> Vec<Expr> {
+    let mut result = fields.to_vec();
+    let mut seen = result
+        .iter()
+        .map(semantic_fingerprint)
+        .collect::<BTreeSet<_>>();
+    for operator in ["multiply", "add", "subtract", "divide"] {
+        if catalog
+            .lookup(operator)
+            .is_none_or(|spec| spec.generation_weight == 0)
+        {
+            continue;
+        }
+        for left in 0..fields.len() {
+            for right in 0..fields.len() {
+                if matches!(operator, "multiply" | "add") && right < left
+                    || matches!(operator, "add" | "subtract") && right == left
+                {
+                    continue;
+                }
+                let Ok(candidate) = operators::build_call_with_catalog(
+                    catalog,
+                    operator,
+                    vec![fields[left].clone(), fields[right].clone()],
+                    BTreeMap::new(),
+                ) else {
+                    continue;
+                };
+                if !limits.accepts_with_catalog(&candidate, catalog)
+                    || analyze_expression(&candidate).rejection_reason.is_some()
+                {
+                    continue;
+                }
+                if seen.insert(semantic_fingerprint(&candidate)) {
+                    result.push(candidate);
+                }
+            }
+        }
+    }
+    result
+}
+
+fn scaffold_windows(domain: &ValueDomain, limits: &Limits) -> Vec<u16> {
+    let mut values = match domain {
+        ValueDomain::WindowSet { values } => values.clone(),
+        ValueDomain::Window { min, max } => {
+            let lower = (*min).max(limits.min_window);
+            let upper = (*max).min(limits.max_window);
+            if lower > upper {
+                Vec::new()
+            } else {
+                vec![lower, lower + (upper - lower) / 2, upper]
+            }
+        }
+        _ => Vec::new(),
+    };
+    values.retain(|value| (limits.min_window..=limits.max_window).contains(value));
+    values.sort_unstable();
+    values.dedup();
+    values.truncate(8);
+    values
+}
+
+fn seeded_catalog_scaffolds(seed: u64, limits: &Limits, catalog: &operators::Catalog) -> Vec<Expr> {
+    let universe = catalog_scaffold_universe(limits, catalog)
+        .into_iter()
+        .filter(|candidate| analyze_expression(candidate).rejection_reason.is_none())
+        .collect::<Vec<_>>();
+    let (fields, candidates): (Vec<_>, Vec<_>) = universe
+        .into_iter()
+        .partition(|candidate| matches!(candidate, Expr::Field { .. }));
+    let mut groups = BTreeMap::<String, Vec<(String, String, Expr)>>::new();
+    for candidate in candidates {
+        let identity = semantic_fingerprint(&candidate);
+        let operator = candidate.operator().unwrap_or("field").to_owned();
+        let key = digest(&format!("seeded-catalog-scaffold:{seed}:{identity}"));
+        groups
+            .entry(operator)
+            .or_default()
+            .push((key, identity, candidate));
+    }
+    for candidates in groups.values_mut() {
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    }
+    let mut queues = groups
+        .into_iter()
+        .map(|(operator, candidates)| {
+            (
+                digest(&format!("seeded-catalog-scaffold-family:{seed}:{operator}")),
+                operator,
+                VecDeque::from(candidates),
+            )
+        })
+        .collect::<Vec<_>>();
+    queues.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut result = fields;
+    while result.len() < MAX_CATALOG_SCAFFOLDS {
+        let mut progressed = false;
+        for (_, _, queue) in &mut queues {
+            if let Some((_, _, candidate)) = queue.pop_front()
+                && result.len() < MAX_CATALOG_SCAFFOLDS
+            {
+                result.push(candidate);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    result
+}
+
+fn scaffold_call(
+    catalog: &operators::Catalog,
+    operator: &str,
+    arguments: Vec<Expr>,
+) -> Option<Expr> {
+    catalog
+        .lookup(operator)
+        .filter(|spec| spec.generation_weight > 0)
+        .and_then(|_| {
+            operators::build_call_with_catalog(catalog, operator, arguments, BTreeMap::new()).ok()
+        })
+}
+
+fn motif_windows(limits: &Limits) -> Vec<u16> {
+    [2, 5, 10, 20, 40]
+        .into_iter()
+        .filter(|window| (limits.min_window..=limits.max_window).contains(window))
+        .collect()
+}
+
+fn add_motif(
+    groups: &mut BTreeMap<String, Vec<Expr>>,
+    family: &str,
+    candidate: Option<Expr>,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if validate_transformed_with_catalog(&candidate, limits, catalog).is_ok()
+        && analyze_expression(&candidate).rejection_reason.is_none()
+    {
+        groups.entry(family.to_owned()).or_default().push(candidate);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn quantitative_motif_universe(
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> BTreeMap<String, Vec<Expr>> {
+    let fields = catalog
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.family.as_str(),
+                Expr::Field {
+                    name: field.name.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let prices = fields
+        .iter()
+        .filter(|(family, _)| *family == "price")
+        .map(|(_, expression)| expression.clone())
+        .collect::<Vec<_>>();
+    let liquidity = fields
+        .iter()
+        .filter(|(family, _)| *family == "liquidity")
+        .map(|(_, expression)| expression.clone())
+        .collect::<Vec<_>>();
+    let windows = motif_windows(limits);
+    let short_windows = windows.iter().copied().filter(|window| *window <= 10);
+    let mut groups = BTreeMap::<String, Vec<Expr>>::new();
+
+    for liquid in &liquidity {
+        for price in &prices {
+            for window in &windows {
+                let scalar = Expr::Scalar {
+                    value: f64::from(*window),
+                };
+                let covariance = scaffold_call(
+                    catalog,
+                    "ts_cov",
+                    vec![liquid.clone(), price.clone(), scalar],
+                );
+                add_motif(
+                    &mut groups,
+                    "liquidity_price_covariance",
+                    covariance.clone(),
+                    limits,
+                    catalog,
+                );
+                for smooth in short_windows.clone() {
+                    let smooth_scalar = Expr::Scalar {
+                        value: f64::from(smooth),
+                    };
+                    add_motif(
+                        &mut groups,
+                        "smoothed_liquidity_price_covariance",
+                        covariance.clone().and_then(|input| {
+                            scaffold_call(catalog, "ts_ema", vec![input, smooth_scalar.clone()])
+                        }),
+                        limits,
+                        catalog,
+                    );
+                    add_motif(
+                        &mut groups,
+                        "averaged_liquidity_price_covariance",
+                        covariance.clone().and_then(|input| {
+                            scaffold_call(catalog, "ts_mean", vec![input, smooth_scalar.clone()])
+                        }),
+                        limits,
+                        catalog,
+                    );
+                }
+            }
+        }
+    }
+
+    for left in 0..prices.len() {
+        for right in left + 1..prices.len() {
+            for window in &windows {
+                let correlation = scaffold_call(
+                    catalog,
+                    "ts_corr",
+                    vec![
+                        prices[left].clone(),
+                        prices[right].clone(),
+                        Expr::Scalar {
+                            value: f64::from(*window),
+                        },
+                    ],
+                );
+                add_motif(
+                    &mut groups,
+                    "price_correlation",
+                    correlation.clone(),
+                    limits,
+                    catalog,
+                );
+                for outer in short_windows.clone() {
+                    let scalar = Expr::Scalar {
+                        value: f64::from(outer),
+                    };
+                    add_motif(
+                        &mut groups,
+                        "smoothed_price_correlation",
+                        correlation.clone().and_then(|input| {
+                            scaffold_call(catalog, "ts_mean", vec![input, scalar.clone()])
+                        }),
+                        limits,
+                        catalog,
+                    );
+                    add_motif(
+                        &mut groups,
+                        "bounded_price_correlation",
+                        correlation.clone().and_then(|input| {
+                            scaffold_call(catalog, "ts_min", vec![input, scalar.clone()])
+                        }),
+                        limits,
+                        catalog,
+                    );
+                }
+            }
+        }
+    }
+
+    for price in &prices {
+        for window in &windows {
+            let dispersion = scaffold_call(
+                catalog,
+                "ts_std_dev",
+                vec![
+                    price.clone(),
+                    Expr::Scalar {
+                        value: f64::from(*window),
+                    },
+                ],
+            );
+            add_motif(
+                &mut groups,
+                "absolute_price_dispersion",
+                dispersion
+                    .clone()
+                    .and_then(|input| scaffold_call(catalog, "abs", vec![input])),
+                limits,
+                catalog,
+            );
+            for smooth in short_windows.clone() {
+                add_motif(
+                    &mut groups,
+                    "smoothed_price_dispersion",
+                    dispersion.clone().and_then(|input| {
+                        scaffold_call(
+                            catalog,
+                            "ts_ema",
+                            vec![
+                                input,
+                                Expr::Scalar {
+                                    value: f64::from(smooth),
+                                },
+                            ],
+                        )
+                    }),
+                    limits,
+                    catalog,
+                );
+            }
+        }
+    }
+    groups
+}
+
+fn motif_catalog_scaffolds(seed: u64, limits: &Limits, catalog: &operators::Catalog) -> Vec<Expr> {
+    let universe = catalog_scaffold_universe(limits, catalog)
+        .into_iter()
+        .filter(|candidate| analyze_expression(candidate).rejection_reason.is_none())
+        .collect::<Vec<_>>();
+    let (fields, candidates): (Vec<_>, Vec<_>) = universe
+        .into_iter()
+        .partition(|candidate| matches!(candidate, Expr::Field { .. }));
+    let mut identities = fields
+        .iter()
+        .map(semantic_fingerprint)
+        .collect::<BTreeSet<_>>();
+    let mut result = fields;
+
+    let mut root_groups = BTreeMap::<String, Vec<(String, String, Expr)>>::new();
+    for candidate in candidates {
+        let identity = semantic_fingerprint(&candidate);
+        let operator = candidate.operator().unwrap_or("field").to_owned();
+        let key = digest(&format!("motif-root-cover:{seed}:{identity}"));
+        root_groups
+            .entry(operator)
+            .or_default()
+            .push((key, identity, candidate));
+    }
+    for candidates in root_groups.values_mut() {
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    }
+    let mut root_queues = root_groups.into_iter().collect::<Vec<_>>();
+    root_queues.sort_by(|left, right| {
+        digest(&format!("motif-root-family:{seed}:{}", left.0))
+            .cmp(&digest(&format!("motif-root-family:{seed}:{}", right.0)))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (_, candidates) in &root_queues {
+        if let Some((_, identity, candidate)) = candidates.first()
+            && result.len() < MAX_CATALOG_SCAFFOLDS
+            && identities.insert(identity.clone())
+        {
+            result.push(candidate.clone());
+        }
+    }
+
+    let mut motif_queues = quantitative_motif_universe(limits, catalog)
+        .into_iter()
+        .map(|(family, candidates)| {
+            let mut candidates = candidates
+                .into_iter()
+                .map(|candidate| {
+                    let identity = semantic_fingerprint(&candidate);
+                    let key = digest(&format!("motif-candidate:{seed}:{family}:{identity}"));
+                    (key, identity, candidate)
+                })
+                .collect::<Vec<_>>();
+            candidates
+                .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            (
+                digest(&format!("motif-family:{seed}:{family}")),
+                family,
+                VecDeque::from(candidates),
+            )
+        })
+        .collect::<Vec<_>>();
+    motif_queues.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    while result.len() < MAX_CATALOG_SCAFFOLDS {
+        let mut progressed = false;
+        for (_, _, queue) in &mut motif_queues {
+            while let Some((_, identity, candidate)) = queue.pop_front() {
+                if identities.insert(identity) {
+                    result.push(candidate);
+                    progressed = true;
+                    break;
+                }
+            }
+            if result.len() >= MAX_CATALOG_SCAFFOLDS {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    if result.len() < MAX_CATALOG_SCAFFOLDS {
+        let mut remainder = root_queues
+            .into_iter()
+            .flat_map(|(_, candidates)| candidates)
+            .collect::<Vec<_>>();
+        remainder.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        for (_, identity, candidate) in remainder {
+            if result.len() >= MAX_CATALOG_SCAFFOLDS {
+                break;
+            }
+            if identities.insert(identity) {
+                result.push(candidate);
+            }
+        }
+    }
+    result
 }
 
 /// Deterministic indexed typed mutation with a bounded retry budget.
@@ -299,6 +1007,53 @@ pub fn mutate_with_catalog(
     mutate_with_rng(parent, class, &mut rng, limits, catalog)
 }
 
+/// Choose uniformly among mutation classes with a successful bounded local trial.
+/// Unlike the legacy policy, classes without matching paths are not sampled.
+/// Each class gets at most the usual retry budget; at most eight candidates are
+/// retained. If none succeeds, emit an explicitly recorded fresh fallback.
+/// This opt-in policy does not alter the legacy mutation RNG stream.
+#[must_use]
+pub fn mutate_applicable_with_catalog(
+    parent: &Expr,
+    seed: u64,
+    ordinal: u64,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> (Expr, Provenance) {
+    let paths = enumerate_paths(parent);
+    let mut candidates = Vec::new();
+    for class in MutationClass::ALL {
+        if !paths
+            .iter()
+            .any(|entry| mutation_path_matches(parent, entry, class, catalog))
+        {
+            continue;
+        }
+        let mut rng = seeded(
+            seed,
+            ordinal,
+            0xa076_1d64_78bd_642f ^ mutation_domain(class),
+        );
+        if let Some(candidate) = try_mutate_with_rng(parent, class, &mut rng, limits, catalog) {
+            candidates.push(candidate);
+        }
+    }
+    let mut rng = seeded(seed, ordinal, 0x3eed_819f_a214_2a79);
+    if candidates.is_empty() {
+        fallback_generation(
+            parent,
+            "applicable_mutation",
+            &mut rng,
+            limits,
+            RETRY_BUDGET,
+            catalog,
+        )
+    } else {
+        let index = rng.random_range(0..candidates.len());
+        candidates.swap_remove(index)
+    }
+}
+
 /// Deterministically request one specific mutation class.
 #[must_use]
 pub fn mutate_with_class(
@@ -308,18 +1063,32 @@ pub fn mutate_with_class(
     ordinal: u64,
     limits: &Limits,
 ) -> (Expr, Provenance) {
+    mutate_with_class_and_catalog(
+        parent,
+        class,
+        seed,
+        ordinal,
+        limits,
+        operators::builtin_catalog(),
+    )
+}
+
+/// Deterministically request one mutation class under an explicit catalog.
+#[must_use]
+pub fn mutate_with_class_and_catalog(
+    parent: &Expr,
+    class: MutationClass,
+    seed: u64,
+    ordinal: u64,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> (Expr, Provenance) {
     let mut rng = seeded(
         seed,
         ordinal,
         0xa076_1d64_78bd_642f ^ mutation_domain(class),
     );
-    mutate_with_rng(
-        parent,
-        class,
-        &mut rng,
-        limits,
-        operators::builtin_catalog(),
-    )
+    mutate_with_rng(parent, class, &mut rng, limits, catalog)
 }
 
 fn mutate_with_rng(
@@ -329,6 +1098,26 @@ fn mutate_with_rng(
     limits: &Limits,
     catalog: &operators::Catalog,
 ) -> (Expr, Provenance) {
+    if let Some(candidate) = try_mutate_with_rng(parent, class, rng, limits, catalog) {
+        return candidate;
+    }
+    fallback_generation(
+        parent,
+        class.operation(),
+        rng,
+        limits,
+        RETRY_BUDGET,
+        catalog,
+    )
+}
+
+fn try_mutate_with_rng(
+    parent: &Expr,
+    class: MutationClass,
+    rng: &mut ChaCha8Rng,
+    limits: &Limits,
+    catalog: &operators::Catalog,
+) -> Option<(Expr, Provenance)> {
     let requested = class.operation().to_owned();
     for retry in 0..RETRY_BUDGET {
         let Some((path, replacement)) = mutation_replacement(parent, class, rng, limits, catalog)
@@ -349,7 +1138,7 @@ fn mutate_with_rng(
         {
             continue;
         }
-        return (
+        return Some((
             candidate,
             successful_provenance(
                 TransformKind::Mutation,
@@ -360,9 +1149,9 @@ fn mutate_with_rng(
                 retry,
                 vec![semantic_fingerprint(parent)],
             ),
-        );
+        ));
     }
-    fallback_generation(parent, &requested, rng, limits, RETRY_BUDGET, catalog)
+    None
 }
 
 /// Deterministic typed subtree crossover using compatible indexed paths.
@@ -1104,6 +1893,59 @@ mod tests {
     }
 
     #[test]
+    fn generation_domain_is_enforced_after_transforms_without_restricting_windows() {
+        let mut catalog = operators::builtin_catalog().clone();
+        catalog.scalar_domain = operators::ScalarDomain {
+            min: -2.0,
+            max: 2.0,
+            step: 0.5,
+        };
+        let limits = Limits::default();
+        for source in [
+            "ts_var(divide(volume,40),40)",
+            "multiply(20,low)",
+            "multiply(close,0.25)",
+            "multiply(close,-2.5)",
+        ] {
+            // Parsing user input remains broader than research generation.
+            let expr = parse_expression_with_catalog(source, &catalog).unwrap();
+            assert!(
+                validate_transformed_with_catalog(&expr, &limits, &catalog).is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            "ts_var(divide(volume,2),40)",
+            "multiply(close,-1.5)",
+            "winsorize(ts_mean(close,40),std=3)",
+        ] {
+            let expr = parse_expression_with_catalog(source, &catalog).unwrap();
+            validate_transformed_with_catalog(&expr, &limits, &catalog).unwrap();
+        }
+    }
+
+    #[test]
+    fn narrow_domain_generation_mutation_and_crossover_remain_valid() {
+        let mut catalog = operators::builtin_catalog().clone();
+        catalog.scalar_domain = operators::ScalarDomain {
+            min: -2.0,
+            max: 2.0,
+            step: 0.5,
+        };
+        let limits = Limits::default();
+        for index in 0..512 {
+            let (left, _) = generate_with_catalog(919, index, &limits, &catalog);
+            let (right, _) = generate_with_catalog(929, index, &limits, &catalog);
+            validate_transformed_with_catalog(&left, &limits, &catalog).unwrap();
+            validate_transformed_with_catalog(&right, &limits, &catalog).unwrap();
+            let (child, _) = crossover_with_catalog(&left, &right, 919, index, &limits, &catalog);
+            validate_transformed_with_catalog(&child, &limits, &catalog).unwrap();
+            let (mutant, _) = mutate_with_catalog(&child, 929, index, &limits, &catalog);
+            validate_transformed_with_catalog(&mutant, &limits, &catalog).unwrap();
+        }
+    }
+
+    #[test]
     fn fixed_workload_covers_every_mutation_class() {
         let parent = rich_parent();
         let limits = Limits::default();
@@ -1151,6 +1993,175 @@ mod tests {
     }
 
     #[test]
+    fn initial_generation_starts_with_a_deterministic_catalog_scaffold() {
+        let catalog = operators::builtin_catalog();
+        let limits = Limits::default();
+        let generated = (0..MAX_CATALOG_SCAFFOLDS as u64)
+            .map(|index| generate_with_catalog(7, index, &limits, catalog))
+            .collect::<Vec<_>>();
+        assert!(generated.iter().all(|(_, provenance)| {
+            provenance.operation == CATALOG_SCAFFOLD_OPERATION
+                && provenance.kind == TransformKind::Initial
+        }));
+        let expressions = generated
+            .iter()
+            .map(|(expression, _)| canonical(expression))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expressions.len(), MAX_CATALOG_SCAFFOLDS);
+        for field in &catalog.fields {
+            assert!(expressions.contains(&field.name));
+        }
+        for expression in [
+            "multiply(close, close)",
+            "multiply(open, open)",
+            "multiply(high, low)",
+        ] {
+            let expected = canonical(&parse_expression(expression).unwrap());
+            assert!(expressions.contains(&expected), "missing {expected}");
+        }
+        let (_, after_scaffold) =
+            generate_with_catalog(7, MAX_CATALOG_SCAFFOLDS as u64, &limits, catalog);
+        assert_eq!(after_scaffold.operation, "grammar_sample");
+    }
+
+    #[test]
+    fn seeded_catalog_scaffold_is_balanced_deterministic_and_seed_diverse() {
+        let catalog = operators::builtin_catalog();
+        let limits = Limits::default();
+        let generate_cover = |seed| {
+            (0..MAX_CATALOG_SCAFFOLDS as u64)
+                .map(|index| {
+                    generate_with_catalog_scaffold_policy(
+                        seed,
+                        index,
+                        &limits,
+                        catalog,
+                        CatalogScaffoldPolicy::SeededDiverse,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = generate_cover(7);
+        let repeated = generate_cover(7);
+        let other_seed = generate_cover(11);
+        assert_eq!(first, repeated);
+        assert!(first.iter().all(|(_, provenance)| {
+            provenance.operation == SEEDED_CATALOG_SCAFFOLD_OPERATION
+                && provenance.kind == TransformKind::Initial
+        }));
+        let expressions = first
+            .iter()
+            .map(|(expression, _)| canonical(expression))
+            .collect::<BTreeSet<_>>();
+        let other_expressions = other_seed
+            .iter()
+            .map(|(expression, _)| canonical(expression))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expressions.len(), MAX_CATALOG_SCAFFOLDS);
+        assert_ne!(expressions, other_expressions);
+        for field in &catalog.fields {
+            assert!(expressions.contains(&field.name));
+        }
+        let root_operators = first
+            .iter()
+            .filter_map(|(expression, _)| expression.operator())
+            .collect::<BTreeSet<_>>();
+        assert!(root_operators.len() >= 12);
+
+        for seed in 0..256 {
+            let scaffold = seeded_catalog_scaffolds(seed, &limits, catalog);
+            assert_eq!(
+                scaffold.len(),
+                MAX_CATALOG_SCAFFOLDS,
+                "seed {seed} did not fill the scaffold budget"
+            );
+            assert!(
+                scaffold
+                    .iter()
+                    .all(|candidate| analyze_expression(candidate).rejection_reason.is_none()),
+                "seed {seed} selected a trivial scaffold candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn motif_catalog_scaffold_preserves_breadth_and_adds_nested_quantitative_families() {
+        let catalog = operators::builtin_catalog();
+        let limits = Limits::default();
+        let generate_cover = |seed| {
+            (0..MAX_CATALOG_SCAFFOLDS as u64)
+                .map(|index| {
+                    generate_with_catalog_scaffold_policy(
+                        seed,
+                        index,
+                        &limits,
+                        catalog,
+                        CatalogScaffoldPolicy::MotifDiverse,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = generate_cover(7);
+        let repeated = generate_cover(7);
+        let other_seed = generate_cover(11);
+        assert_eq!(first, repeated);
+        assert!(first.iter().all(|(_, provenance)| {
+            provenance.operation == MOTIF_CATALOG_SCAFFOLD_OPERATION
+                && provenance.kind == TransformKind::Initial
+        }));
+        let expressions = first
+            .iter()
+            .map(|(expression, _)| canonical(expression))
+            .collect::<BTreeSet<_>>();
+        let other_expressions = other_seed
+            .iter()
+            .map(|(expression, _)| canonical(expression))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expressions.len(), MAX_CATALOG_SCAFFOLDS);
+        assert_ne!(expressions, other_expressions);
+        for field in &catalog.fields {
+            assert!(expressions.contains(&field.name));
+        }
+        let root_operators = first
+            .iter()
+            .filter_map(|(expression, _)| expression.operator())
+            .collect::<BTreeSet<_>>();
+        assert!(root_operators.len() >= 20);
+        assert!(
+            expressions
+                .iter()
+                .any(|expression| expression.starts_with("ts_cov("))
+        );
+        assert!(
+            expressions
+                .iter()
+                .any(|expression| expression.starts_with("ts_corr("))
+        );
+        assert!(expressions.iter().any(|expression| {
+            (expression.starts_with("ts_ema(") || expression.starts_with("ts_mean("))
+                && expression.contains("ts_cov(")
+        }));
+        assert!(expressions.iter().any(|expression| {
+            (expression.starts_with("ts_mean(") || expression.starts_with("ts_min("))
+                && expression.contains("ts_corr(")
+        }));
+        assert!(
+            expressions
+                .iter()
+                .any(|expression| expression.contains("ts_std_dev("))
+        );
+
+        for seed in 0..64 {
+            let scaffold = motif_catalog_scaffolds(seed, &limits, catalog);
+            assert_eq!(scaffold.len(), MAX_CATALOG_SCAFFOLDS);
+            assert!(scaffold.iter().all(|candidate| {
+                analyze_expression(candidate).rejection_reason.is_none()
+                    && limits.accepts_with_catalog(candidate, catalog)
+            }));
+        }
+    }
+
+    #[test]
     fn synthetic_operator_generation_requires_only_catalog_data() {
         let mut catalog = operators::builtin_catalog().clone();
         catalog.operators.push(OperatorSpec {
@@ -1170,7 +2181,7 @@ mod tests {
             parse_only_reason: None,
         });
         catalog.validate().unwrap();
-        let (expression, _) = generate_with_catalog(7, 11, &Limits::default(), &catalog);
+        let (expression, _) = generate_with_catalog(7, 111, &Limits::default(), &catalog);
         let mut observed = BTreeSet::new();
         collect_operators(&expression, &mut observed);
         assert!(observed.contains("synthetic_smooth"));

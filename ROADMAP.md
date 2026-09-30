@@ -24,6 +24,11 @@ feedback show that a different order is more useful.
   diagnostics.
 - Optional local Sharadar-compatible Parquet preparation.
 - Immutable measured-feedback prioritization with leave-one-out auditing.
+- Opt-in measured-feedback parent guidance, archive seeding, and bounded
+  feedback-derived operator weights with manifest provenance.
+- A library-only ask/tell search session with explicit evaluator context,
+  finite-outcome validation, bounded proposals, and checkpoint restoration.
+- Explicit same-cohort score/uniform retention policies for controlled studies.
 - Target-dialect compilation and fail-closed linting.
 
 ## Next
@@ -97,10 +102,11 @@ dominates runtime after CPU vectorization and shared-DAG reuse. The CPU backend
 will remain supported and GPU transfer overhead will be included in every
 comparison.
 
-### Stable library release
+### Public API stabilization
 
-Prepare the public Rust API for a crates.io release with versioned artifact
-schemas, migration guidance, examples, and a documented compatibility policy.
+Continue stabilizing the published pre-1.0 Rust API. Release 0.2.0 documents
+breaking API/artifact changes and includes a synthetic ask/tell example;
+long-term cross-version checkpoint compatibility is not yet promised.
 
 ## Good first contributions
 
@@ -153,4 +159,3 @@ A roadmap item is complete only when:
 3. relevant correctness and numeric parity tests pass;
 4. resource use is measured on a reproducible workload;
 5. `cargo fmt`, Clippy with warnings denied, and all-feature tests pass.
-

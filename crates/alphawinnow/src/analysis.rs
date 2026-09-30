@@ -34,7 +34,7 @@ pub struct ExpressionAnalysis {
     pub rejection_reason: Option<RejectionReason>,
 }
 
-/// Analyze final-root scale identity and conservative triviality.
+/// Analyze conservative semantic identity and triviality.
 #[must_use]
 pub fn analyze_expression(expression: &Expr) -> ExpressionAnalysis {
     let semantic_canonical = canonical(&semantic_normal_form(expression));
@@ -50,10 +50,10 @@ pub fn analyze_expression(expression: &Expr) -> ExpressionAnalysis {
     }
 }
 
-/// Build a conservative normal form for final-root scaling only.
+/// Build a conservative normal form for exact identities and final-root scaling.
 #[must_use]
 pub(crate) fn semantic_normal_form(expression: &Expr) -> Expr {
-    let simplified = simplify_deterministic_conditionals(expression);
+    let simplified = simplify_exact_identities(expression);
     semantic_root_normal_form(&simplified)
 }
 
@@ -76,7 +76,7 @@ fn semantic_root_normal_form(expression: &Expr) -> Expr {
     expression.clone()
 }
 
-fn simplify_deterministic_conditionals(expression: &Expr) -> Expr {
+fn simplify_exact_identities(expression: &Expr) -> Expr {
     match expression {
         Expr::Field { .. } | Expr::Scalar { .. } | Expr::Group { .. } | Expr::Bool { .. } => {
             expression.clone()
@@ -86,15 +86,39 @@ fn simplify_deterministic_conditionals(expression: &Expr) -> Expr {
             arg,
             kwargs,
             kind,
-        } => Expr::UnaryCall {
-            op: op.clone(),
-            arg: Box::new(simplify_deterministic_conditionals(arg)),
-            kwargs: kwargs
+        } => {
+            let arg = simplify_exact_identities(arg);
+            let kwargs: BTreeMap<_, _> = kwargs
                 .iter()
-                .map(|(name, value)| (name.clone(), simplify_deterministic_conditionals(value)))
-                .collect(),
-            kind: *kind,
-        },
+                .map(|(name, value)| (name.clone(), simplify_exact_identities(value)))
+                .collect();
+
+            // The benchmark's cross-sectional rank assigns every finite value a
+            // unique ordinal and restores NaNs at their original positions.
+            // Ranking that result again is therefore exactly idempotent.  Keep
+            // this deliberately narrow: time-series and grouped ranks have
+            // different semantics, and scaling inside rank remains significant.
+            if op == "rank"
+                && kwargs.is_empty()
+                && matches!(
+                    &arg,
+                    Expr::UnaryCall {
+                        op: inner_op,
+                        kwargs: inner_kwargs,
+                        ..
+                    } if inner_op == "rank" && inner_kwargs.is_empty()
+                )
+            {
+                return arg;
+            }
+
+            Expr::UnaryCall {
+                op: op.clone(),
+                arg: Box::new(arg),
+                kwargs,
+                kind: *kind,
+            }
+        }
         Expr::BinaryCall {
             op,
             left,
@@ -103,11 +127,11 @@ fn simplify_deterministic_conditionals(expression: &Expr) -> Expr {
             kind,
         } => Expr::BinaryCall {
             op: op.clone(),
-            left: Box::new(simplify_deterministic_conditionals(left)),
-            right: Box::new(simplify_deterministic_conditionals(right)),
+            left: Box::new(simplify_exact_identities(left)),
+            right: Box::new(simplify_exact_identities(right)),
             kwargs: kwargs
                 .iter()
-                .map(|(name, value)| (name.clone(), simplify_deterministic_conditionals(value)))
+                .map(|(name, value)| (name.clone(), simplify_exact_identities(value)))
                 .collect(),
             kind: *kind,
         },
@@ -117,10 +141,7 @@ fn simplify_deterministic_conditionals(expression: &Expr) -> Expr {
             kwargs,
             kind,
         } => {
-            let args: Vec<_> = args
-                .iter()
-                .map(simplify_deterministic_conditionals)
-                .collect();
+            let args: Vec<_> = args.iter().map(simplify_exact_identities).collect();
             if op == "if_else"
                 && let [condition, when_true, when_false] = args.as_slice()
             {
@@ -140,7 +161,7 @@ fn simplify_deterministic_conditionals(expression: &Expr) -> Expr {
                 args,
                 kwargs: kwargs
                     .iter()
-                    .map(|(name, value)| (name.clone(), simplify_deterministic_conditionals(value)))
+                    .map(|(name, value)| (name.clone(), simplify_exact_identities(value)))
                     .collect(),
                 kind: *kind,
             }
@@ -194,6 +215,12 @@ fn collect_root_product(expression: &Expr, scalar: &mut f64, factors: &mut Vec<E
         Expr::VariadicCall { op, args, .. } if op == "multiply" => args
             .iter()
             .all(|arg| collect_root_product(arg, scalar, factors)),
+        Expr::BinaryCall {
+            op, left, right, ..
+        } if op == "multiply" => {
+            collect_root_product(left, scalar, factors)
+                && collect_root_product(right, scalar, factors)
+        }
         Expr::BinaryCall {
             op, left, right, ..
         } if op == "divide" => {
@@ -262,7 +289,7 @@ fn signal_fact(expression: &Expr) -> SignalFact {
 
 fn unary_fact(op: &str, arg: SignalFact, kwargs: &BTreeMap<String, Expr>) -> SignalFact {
     match (op, arg) {
-        ("negate" | "winsorize", SignalFact::Zero) => SignalFact::Zero,
+        ("abs" | "negate" | "sign" | "winsorize", SignalFact::Zero) => SignalFact::Zero,
         ("clip", SignalFact::Zero) => {
             let lower = scalar_keyword(kwargs, "lower");
             let upper = scalar_keyword(kwargs, "upper");
@@ -280,8 +307,20 @@ fn unary_fact(op: &str, arg: SignalFact, kwargs: &BTreeMap<String, Expr>) -> Sig
 fn binary_fact(op: &str, left: &Expr, right: &Expr) -> SignalFact {
     let left_fact = signal_fact(left);
     match op {
+        "multiply" => {
+            let right_fact = signal_fact(right);
+            if is_literal_zero(left)
+                || is_literal_zero(right)
+                || left_fact == SignalFact::Zero
+                || right_fact == SignalFact::Zero
+            {
+                SignalFact::Zero
+            } else {
+                combine_constant(left_fact, right_fact)
+            }
+        }
         "subtract" if canonical(left) == canonical(right) => SignalFact::Zero,
-        "subtract" => {
+        "add" | "subtract" => {
             let right_fact = signal_fact(right);
             if left_fact == SignalFact::Zero && right_fact == SignalFact::Zero {
                 SignalFact::Zero
@@ -289,8 +328,9 @@ fn binary_fact(op: &str, left: &Expr, right: &Expr) -> SignalFact {
                 combine_constant(left_fact, right_fact)
             }
         }
-        "divide" | "ts_mean" => preserve_zero(left_fact),
-        "ts_delta" | "ts_std_dev" | "ts_zscore" => match left_fact {
+        "divide" | "ts_delay" | "ts_ema" | "ts_max" | "ts_mean" | "ts_median" | "ts_min"
+        | "ts_sum" | "ts_wma" => preserve_zero(left_fact),
+        "ts_delta" | "ts_mad" | "ts_std_dev" | "ts_var" | "ts_zscore" => match left_fact {
             SignalFact::Zero | SignalFact::Constant => SignalFact::Zero,
             SignalFact::Unknown => SignalFact::Unknown,
         },
@@ -384,7 +424,7 @@ fn is_literal_zero(expression: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_expression;
+    use crate::{Arity, builtin_catalog, parse_expression, parse_expression_with_catalog};
 
     #[test]
     fn deterministic_conditionals_share_the_selected_branch_family() {
@@ -418,6 +458,29 @@ mod tests {
             serde_json::to_string(&RejectionReason::ProvablyZero).unwrap(),
             "\"provably_zero\""
         );
+    }
+
+    #[test]
+    fn binary_multiply_from_a_narrowed_catalog_detects_zero_in_either_slot() {
+        let mut catalog = builtin_catalog().clone();
+        let operator = catalog
+            .operators
+            .iter_mut()
+            .find(|operator| operator.name == "multiply")
+            .unwrap();
+        let input = operator.inputs[0].clone();
+        operator.arity = Arity::Binary;
+        operator.inputs = vec![input; 2];
+
+        for source in ["multiply(0, close)", "multiply(close, 0)"] {
+            let expression = parse_expression_with_catalog(source, &catalog).unwrap();
+            assert!(matches!(expression, Expr::BinaryCall { .. }));
+            assert_eq!(
+                analyze_expression(&expression).rejection_reason,
+                Some(RejectionReason::ProvablyZero),
+                "{source}"
+            );
+        }
     }
 
     #[test]

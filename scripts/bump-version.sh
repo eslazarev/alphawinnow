@@ -6,6 +6,8 @@
 # Prints the new version on stdout; everything explanatory goes to stderr so the
 # caller can capture the version directly. `auto` derives the level from the
 # Conventional Commit subjects since the last `v*` tag.
+# In auto mode, a manifest already ahead of the last tag is a prepared release:
+# keep that exact version instead of incrementing it a second time.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,6 +34,24 @@ patch="${BASH_REMATCH[3]}"
 # Classify the change set when the caller did not decide for us.
 if [[ "${LEVEL}" == "auto" ]]; then
   last_tag="$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+  if [[ "${last_tag}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    tag_major="${BASH_REMATCH[1]}"
+    tag_minor="${BASH_REMATCH[2]}"
+    tag_patch="${BASH_REMATCH[3]}"
+    if (( major > tag_major || (major == tag_major && minor > tag_minor) ||
+          (major == tag_major && minor == tag_minor && patch > tag_patch) )); then
+      # The prepared version must include a matching lockfile. Do not silently
+      # repair it after verification or update dependency versions here.
+      cargo metadata --manifest-path "${MANIFEST}" --format-version 1 --no-deps --locked > /dev/null
+      echo "Using prepared version ${current} (last release ${last_tag})." >&2
+      echo "${current}"
+      exit 0
+    elif (( major < tag_major || (major == tag_major && minor < tag_minor) ||
+            (major == tag_major && minor == tag_minor && patch < tag_patch) )); then
+      echo "Error: manifest ${current} is behind last release ${last_tag}." >&2
+      exit 1
+    fi
+  fi
   range="${last_tag:+${last_tag}..}HEAD"
   subjects="$(git -C "${ROOT_DIR}" log --format='%s%n%b' "${range}" 2>/dev/null || true)"
 

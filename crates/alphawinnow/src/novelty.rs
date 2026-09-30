@@ -58,32 +58,7 @@ fn visit(
     catalog: &Catalog,
     descriptor: &mut StructuralDescriptor,
 ) {
-    if let Some(operator) = expression.operator() {
-        *descriptor
-            .operator_histogram
-            .entry(operator.to_owned())
-            .or_default() += 1;
-        descriptor
-            .ordered_paths
-            .insert(format!("{path}:{operator}"));
-        if let Some(parent) = parent_operator {
-            descriptor
-                .operator_shingles
-                .insert(format!("{parent}>{operator}"));
-        }
-        descriptor.nonlinear |= matches!(
-            operator,
-            "rank"
-                | "zscore"
-                | "ts_rank"
-                | "ts_std_dev"
-                | "ts_zscore"
-                | "winsorize"
-                | "clip"
-                | "group_rank"
-        );
-        descriptor.conditional |= matches!(operator, "if_else" | "greater");
-    }
+    record_operator(expression, path, parent_operator, descriptor);
     match expression {
         Expr::Field { name } => {
             descriptor.fields.insert(name.clone());
@@ -117,16 +92,7 @@ fn visit(
                 catalog,
                 descriptor,
             );
-            if matches!(
-                op.as_str(),
-                "ts_rank" | "ts_mean" | "ts_std_dev" | "ts_zscore" | "ts_delta"
-            ) && let Expr::Scalar { value } = right.as_ref()
-            {
-                *descriptor
-                    .window_buckets
-                    .entry(window_bucket(*value).to_owned())
-                    .or_default() += 1;
-            }
+            record_binary_window(op, right, descriptor);
             visit_kwargs(kwargs, path, op, catalog, descriptor);
         }
         Expr::VariadicCall {
@@ -141,6 +107,14 @@ fn visit(
                     descriptor,
                 );
             }
+            if matches!(op.as_str(), "ts_cov" | "ts_corr")
+                && let Some(Expr::Scalar { value }) = args.get(2)
+            {
+                *descriptor
+                    .window_buckets
+                    .entry(window_bucket(*value).to_owned())
+                    .or_default() += 1;
+            }
             visit_kwargs(kwargs, path, op, catalog, descriptor);
         }
         Expr::Scalar { .. } | Expr::Bool { .. } => {
@@ -148,6 +122,78 @@ fn visit(
                 .ordered_paths
                 .insert(format!("{path}:{}", canonical(expression)));
         }
+    }
+}
+
+fn record_operator(
+    expression: &Expr,
+    path: &str,
+    parent_operator: Option<&str>,
+    descriptor: &mut StructuralDescriptor,
+) {
+    let Some(operator) = expression.operator() else {
+        return;
+    };
+    *descriptor
+        .operator_histogram
+        .entry(operator.to_owned())
+        .or_default() += 1;
+    descriptor
+        .ordered_paths
+        .insert(format!("{path}:{operator}"));
+    if let Some(parent) = parent_operator {
+        descriptor
+            .operator_shingles
+            .insert(format!("{parent}>{operator}"));
+    }
+    descriptor.nonlinear |= matches!(
+        operator,
+        "rank"
+            | "zscore"
+            | "ts_rank"
+            | "ts_std_dev"
+            | "ts_var"
+            | "ts_skew"
+            | "ts_kurt"
+            | "ts_min"
+            | "ts_max"
+            | "ts_median"
+            | "ts_mad"
+            | "ts_cov"
+            | "ts_corr"
+            | "ts_zscore"
+            | "winsorize"
+            | "clip"
+            | "group_rank"
+    );
+    descriptor.conditional |= matches!(operator, "if_else" | "greater");
+}
+
+fn record_binary_window(op: &str, right: &Expr, descriptor: &mut StructuralDescriptor) {
+    if matches!(
+        op,
+        "ts_rank"
+            | "ts_mean"
+            | "ts_sum"
+            | "ts_std_dev"
+            | "ts_var"
+            | "ts_skew"
+            | "ts_kurt"
+            | "ts_min"
+            | "ts_max"
+            | "ts_median"
+            | "ts_mad"
+            | "ts_wma"
+            | "ts_ema"
+            | "ts_zscore"
+            | "ts_delta"
+            | "ts_delay"
+    ) && let Expr::Scalar { value } = right
+    {
+        *descriptor
+            .window_buckets
+            .entry(window_bucket(*value).to_owned())
+            .or_default() += 1;
     }
 }
 
@@ -300,6 +346,14 @@ mod tests {
         assert_eq!(value.window_buckets["short"], 1);
         assert!(value.groups.contains("sector"));
         assert!(value.conditional);
+        assert!(value.nonlinear);
+    }
+
+    #[test]
+    fn descriptor_captures_pair_rolling_window() {
+        let value = descriptor("ts_corr(ts_delay(close, 5), volume, 40)");
+        assert_eq!(value.window_buckets["short"], 1);
+        assert_eq!(value.window_buckets["medium"], 1);
         assert!(value.nonlinear);
     }
 

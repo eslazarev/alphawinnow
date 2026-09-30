@@ -13,15 +13,21 @@ use crate::{
     StructuralScoreConfig, StructuralScoreWeights, analyze_expression,
     artifact::{
         ArtifactError, CANDIDATE_SCHEMA, CHECKPOINT_SCHEMA, CandidateRecord, CheckpointDraft,
-        MANIFEST_SCHEMA, RunCheckpoint, RunManifest, candidate_content, read_candidates,
-        read_checkpoint, write_checkpoint_atomic,
+        FeedbackProvenance, MANIFEST_SCHEMA, OperatorPolicyProvenance, RunCheckpoint, RunManifest,
+        candidate_content, read_candidates, read_checkpoint, write_checkpoint_atomic,
     },
     canonical::{canonical, digest, fingerprint},
     deduplicate_with_catalog, describe_with_catalog, descriptor_distance,
+    feedback::{
+        FeedbackConfig, FeedbackDataset, FeedbackError, GuidanceEstimate, OperatorPolicyConfig,
+        estimate_candidate_guidance_prevalidated, reweight_operator_catalog,
+    },
     operators::Catalog,
     parse_expression_with_catalog,
     transform::{
-        Provenance, crossover_with_catalog, generate_with_catalog, mutate_with_catalog,
+        CatalogScaffoldPolicy, MutationClass, Provenance, crossover_with_catalog,
+        generate_with_catalog, generate_with_catalog_scaffold_policy,
+        is_catalog_scaffold_operation, mutate_with_catalog, mutate_with_class_and_catalog,
         validate_transformed_with_catalog,
     },
 };
@@ -51,6 +57,31 @@ pub enum SearchError {
     Checkpoint(String),
     #[error("invalid operator catalog: {0}")]
     Catalog(String),
+    #[error("invalid measured feedback: {0}")]
+    Feedback(#[from] FeedbackError),
+    #[error("cannot seed the parent population from an empty accepted archive")]
+    EmptySeedArchive,
+    #[error("frozen seed parents require both archive seeding and measured feedback")]
+    FrozenSeedParentsRequireGuidedArchive,
+    #[error("feedback elite parents require measured feedback")]
+    FeedbackEliteParentsRequireGuidance,
+    #[error("feedback elite parent count exceeds the configured parent pool capacity")]
+    FeedbackEliteParentCountExceedsCapacity,
+    #[error("outcome-aware operator policy requires measured feedback")]
+    OperatorPolicyRequiresGuidance,
+    #[error("a separate action-evidence archive requires an outcome-aware operator policy")]
+    ActionArchiveRequiresOperatorPolicy,
+    #[error("cannot restore an accepted archive candidate: {0}")]
+    SeedArchive(String),
+}
+
+#[derive(Debug, Clone)]
+/// Immutable measured evidence and deterministic configuration used to guide search.
+pub struct SearchGuidance {
+    /// Versioned local measurements used by the guidance estimator.
+    pub dataset: FeedbackDataset,
+    /// Neighbor selection, distance, and confidence settings for guidance.
+    pub config: FeedbackConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +89,13 @@ pub struct SearchRunOptions {
     pub checkpoint_path: Option<PathBuf>,
     pub resume_from: Option<PathBuf>,
     pub pause_after_generations: Option<u64>,
+    pub guidance: Option<SearchGuidance>,
+    pub seed_from_archive: bool,
+    pub freeze_seed_parents: bool,
+    pub feedback_elite_parent_count: usize,
+    pub operator_policy: Option<OperatorPolicyConfig>,
+    pub operator_policy_action_archive: Option<PathBuf>,
+    pub catalog_scaffold_policy: CatalogScaffoldPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +112,36 @@ struct ScoredDraft {
     structural_score: f64,
     components: StructuralScoreComponents,
     weights: StructuralScoreWeights,
+    guidance: Option<GuidanceEstimate>,
+}
+
+struct GuidanceState<'a> {
+    dataset: &'a FeedbackDataset,
+    config: &'a FeedbackConfig,
+    checksum: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct TransformActionPolicy {
+    mutation_weight: u16,
+    crossover_weight: u16,
+    mutation_class_weights: [u16; 8],
+}
+
+impl TransformActionPolicy {
+    fn audit_weights(&self) -> BTreeMap<String, u16> {
+        let mut weights = BTreeMap::from([
+            ("kind:crossover".to_owned(), self.crossover_weight),
+            ("kind:mutation".to_owned(), self.mutation_weight),
+        ]);
+        for (class, weight) in MutationClass::ALL
+            .into_iter()
+            .zip(self.mutation_class_weights)
+        {
+            weights.insert(format!("mutation:{}", class.operation()), weight);
+        }
+        weights
+    }
 }
 
 #[derive(Debug)]
@@ -167,6 +235,18 @@ fn draft_from_checkpoint(value: CheckpointDraft, catalog: &Catalog) -> Result<Dr
     })
 }
 
+fn draft_from_candidate(value: &CandidateRecord, catalog: &Catalog) -> Result<Draft, SearchError> {
+    let expression = parse_expression_with_catalog(&value.expression, catalog)
+        .map_err(|error| SearchError::SeedArchive(error.to_string()))?;
+    let analysis = analyze_expression(&expression);
+    Ok(Draft {
+        descriptor: describe_with_catalog(&expression, &value.provenance, catalog),
+        expression,
+        provenance: value.provenance.clone(),
+        semantic_fingerprint: analysis.semantic_fingerprint,
+    })
+}
+
 /// Run a bounded, offline structural search. No market metric is computed.
 ///
 /// # Errors
@@ -216,8 +296,66 @@ pub fn run_search_with_options_and_catalog(
     catalog: &Catalog,
 ) -> Result<SearchResult, SearchError> {
     spec.validate()?;
+    if options.freeze_seed_parents && (!options.seed_from_archive || options.guidance.is_none()) {
+        return Err(SearchError::FrozenSeedParentsRequireGuidedArchive);
+    }
+    if options.feedback_elite_parent_count > 0 && options.guidance.is_none() {
+        return Err(SearchError::FeedbackEliteParentsRequireGuidance);
+    }
+    if options.feedback_elite_parent_count > spec.resources.parent_pool_capacity {
+        return Err(SearchError::FeedbackEliteParentCountExceedsCapacity);
+    }
+    if options.operator_policy.is_some() && options.guidance.is_none() {
+        return Err(SearchError::OperatorPolicyRequiresGuidance);
+    }
+    if options.operator_policy_action_archive.is_some() && options.operator_policy.is_none() {
+        return Err(SearchError::ActionArchiveRequiresOperatorPolicy);
+    }
+    let (effective_catalog, operator_policy_report) = if let Some(policy) = &options.operator_policy
+    {
+        let guidance = options
+            .guidance
+            .as_ref()
+            .ok_or(SearchError::OperatorPolicyRequiresGuidance)?;
+        let (adjusted, report) = reweight_operator_catalog(catalog, &guidance.dataset, policy)?;
+        (adjusted, Some(report))
+    } else {
+        (catalog.clone(), None)
+    };
+    let catalog = &effective_catalog;
     catalog.validate().map_err(SearchError::Catalog)?;
     validate_search_catalog(catalog)?;
+    let feedback_checksum = options
+        .guidance
+        .as_ref()
+        .map(|guidance| {
+            guidance.dataset.validate()?;
+            guidance.config.validate()?;
+            Ok::<_, FeedbackError>(guidance.dataset.checksum())
+        })
+        .transpose()?;
+    let measured_feedback = options
+        .guidance
+        .as_ref()
+        .zip(feedback_checksum.as_ref())
+        .map(|(guidance, checksum)| FeedbackProvenance {
+            dataset_id: guidance.dataset.dataset_id.clone(),
+            context_checksum: guidance.dataset.context_checksum.clone(),
+            feedback_checksum: checksum.clone(),
+            configuration_checksum: digest(
+                &serde_json::to_string(&guidance.config).unwrap_or_default(),
+            ),
+            outcome_label: guidance.dataset.outcome_label.clone(),
+        });
+    let guidance_state = options
+        .guidance
+        .as_ref()
+        .zip(feedback_checksum.as_deref())
+        .map(|(guidance, checksum)| GuidanceState {
+            dataset: &guidance.dataset,
+            config: &guidance.config,
+            checksum,
+        });
     let config = serde_json::to_string(spec)?;
     let config_checksum = digest(&config);
     let mut candidate_identity_spec = spec.clone();
@@ -237,12 +375,77 @@ pub fn run_search_with_options_and_catalog(
         .map(read_candidates)
         .transpose()?
         .unwrap_or_default();
+    let external_action_records = options
+        .operator_policy_action_archive
+        .as_deref()
+        .map(read_candidates)
+        .transpose()?;
+    if let Some(records) = &external_action_records {
+        if records.is_empty() {
+            return Err(SearchError::EmptySeedArchive);
+        }
+        for record in records {
+            draft_from_candidate(record, catalog)?;
+        }
+    }
+    let action_records = external_action_records
+        .as_deref()
+        .unwrap_or(raw_archive_records.as_slice());
+    let action_archive_checksum = external_action_records
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .map(|content| digest(&content));
+    let transform_action_policy = options
+        .operator_policy
+        .as_ref()
+        .zip(options.guidance.as_ref())
+        .map(|(config, guidance)| {
+            transform_action_policy(action_records, &guidance.dataset, config)
+        });
     let archive_record_count = raw_archive_records.len();
     let archive_partition = deduplicate_with_catalog(raw_archive_records, catalog)?;
     let archive_content_checksum = archive_state_checksum(&archive_partition.accepted);
-    let run_id = digest(&format!(
-        "alphawinnow:{candidate_identity_checksum}:{archive_content_checksum}"
-    ));
+    let archive_seed_drafts = if options.seed_from_archive {
+        let seeds = archive_partition
+            .accepted
+            .iter()
+            .map(|record| draft_from_candidate(record, catalog))
+            .collect::<Result<Vec<_>, _>>()?;
+        if seeds.is_empty() {
+            return Err(SearchError::EmptySeedArchive);
+        }
+        seeds
+    } else {
+        Vec::new()
+    };
+    let mut feedback_identity = measured_feedback.as_ref().map_or_else(
+        || "unguided".to_owned(),
+        |provenance| digest(&serde_json::to_string(provenance).unwrap_or_default()),
+    );
+    if let Some(policy) = &transform_action_policy {
+        feedback_identity.push_str(":actions=");
+        feedback_identity.push_str(&digest(&serde_json::to_string(policy)?));
+        if let Some(checksum) = &action_archive_checksum {
+            feedback_identity.push_str(":action_archive=");
+            feedback_identity.push_str(checksum);
+        }
+    }
+    let run_identity = if options.feedback_elite_parent_count == 0 {
+        format!(
+            "alphawinnow:{candidate_identity_checksum}:{archive_content_checksum}:{feedback_identity}:seeded={}:frozen_seed_parents={}:scaffold={:?}",
+            options.seed_from_archive, options.freeze_seed_parents, options.catalog_scaffold_policy,
+        )
+    } else {
+        format!(
+            "alphawinnow:{candidate_identity_checksum}:{archive_content_checksum}:{feedback_identity}:seeded={}:frozen_seed_parents={}:feedback_elite_parents={}:scaffold={:?}",
+            options.seed_from_archive,
+            options.freeze_seed_parents,
+            options.feedback_elite_parent_count,
+            options.catalog_scaffold_policy,
+        )
+    };
+    let run_id = digest(&run_identity);
     let archive_ids: Vec<_> = archive_partition
         .accepted
         .iter()
@@ -284,6 +487,7 @@ pub fn run_search_with_options_and_catalog(
             &run_id,
             &config_checksum,
             &operator_catalog_checksum,
+            measured_feedback.as_ref(),
         )?;
         attempted = checkpoint.attempted_candidates;
         rejected_invalid = checkpoint.rejected_invalid_candidates;
@@ -318,6 +522,9 @@ pub fn run_search_with_options_and_catalog(
         generations_completed = checkpoint.generations_completed;
         generation = checkpoint.next_generation;
         true
+    } else if options.seed_from_archive {
+        population = archive_seed_drafts;
+        false
     } else {
         let initial_count = usize::try_from(spec.max_candidates.min(INITIAL_POPULATION as u64))
             .unwrap_or(INITIAL_POPULATION);
@@ -326,8 +533,13 @@ pub fn run_search_with_options_and_catalog(
                 .into_par_iter()
                 .map(|slot| {
                     let ordinal = u64::try_from(slot).unwrap_or(u64::MAX);
-                    let (expression, provenance) =
-                        generate_with_catalog(spec.seed, ordinal, &spec.limits, catalog);
+                    let (expression, provenance) = generate_with_catalog_scaffold_policy(
+                        spec.seed,
+                        ordinal,
+                        &spec.limits,
+                        catalog,
+                        options.catalog_scaffold_policy,
+                    );
                     prepare(ordinal, &expression, provenance, spec, catalog)
                 })
                 .collect::<Vec<_>>()
@@ -352,17 +564,25 @@ pub fn run_search_with_options_and_catalog(
     }
     peak_elite_archive = peak_elite_archive.max(drafts.len());
     peak_semantic_archive = peak_semantic_archive.max(seen.len());
+    let mut initial_feedback_elites = Vec::new();
     if !resumed {
-        let scored_population =
-            score_drafts(&pool, &population, &archive_descriptors, &spec.scoring);
+        let scored_population = score_drafts(
+            &pool,
+            &population,
+            &archive_descriptors,
+            &spec.scoring,
+            guidance_state.as_ref(),
+        );
+        initial_feedback_elites =
+            feedback_elite_drafts(&scored_population, options.feedback_elite_parent_count);
         population = diverse_elites(scored_population, spec.resources.population_capacity);
     }
     let mut parents: Vec<_> = restored_parents.unwrap_or_else(|| {
-        population
-            .iter()
-            .take(spec.resources.parent_pool_capacity)
-            .cloned()
-            .collect()
+        select_parent_pool(
+            &initial_feedback_elites,
+            &population,
+            spec.resources.parent_pool_capacity,
+        )
     });
     peak_population = peak_population.max(population.len());
     persist_checkpoint(
@@ -370,6 +590,7 @@ pub fn run_search_with_options_and_catalog(
         &run_id,
         &config_checksum,
         &operator_catalog_checksum,
+        measured_feedback.as_ref(),
         generation,
         generations_completed,
         attempted,
@@ -406,8 +627,15 @@ pub fn run_search_with_options_and_catalog(
                 .map(|slot| {
                     let slot = u64::try_from(slot).unwrap_or(u64::MAX);
                     let ordinal = batch_start + slot;
-                    let (expression, provenance) =
-                        offspring(spec, generation, slot, ordinal, &parents, catalog);
+                    let (expression, provenance) = offspring(
+                        spec,
+                        generation,
+                        slot,
+                        ordinal,
+                        &parents,
+                        catalog,
+                        transform_action_policy.as_ref(),
+                    );
                     prepare(ordinal, &expression, provenance, spec, catalog)
                 })
                 .collect::<Vec<_>>()
@@ -437,14 +665,23 @@ pub fn run_search_with_options_and_catalog(
             deadline_reached = true;
             break;
         }
-        let scored_population =
-            score_drafts(&pool, &population, &archive_descriptors, &spec.scoring);
+        let scored_population = score_drafts(
+            &pool,
+            &population,
+            &archive_descriptors,
+            &spec.scoring,
+            guidance_state.as_ref(),
+        );
+        let feedback_elites =
+            feedback_elite_drafts(&scored_population, options.feedback_elite_parent_count);
         population = diverse_elites(scored_population, spec.resources.population_capacity);
-        parents = population
-            .iter()
-            .take(spec.resources.parent_pool_capacity)
-            .cloned()
-            .collect();
+        if !options.freeze_seed_parents {
+            parents = select_parent_pool(
+                &feedback_elites,
+                &population,
+                spec.resources.parent_pool_capacity,
+            );
+        }
         peak_population = peak_population.max(population.len());
         peak_elite_archive = peak_elite_archive.max(drafts.len());
         peak_semantic_archive = peak_semantic_archive.max(seen.len());
@@ -455,6 +692,7 @@ pub fn run_search_with_options_and_catalog(
             &run_id,
             &config_checksum,
             &operator_catalog_checksum,
+            measured_feedback.as_ref(),
             generation,
             generations_completed,
             attempted,
@@ -482,16 +720,42 @@ pub fn run_search_with_options_and_catalog(
     } else {
         drafts.as_slice()
     };
-    let scored = score_drafts(&pool, final_drafts, &archive_descriptors, &spec.scoring);
+    let scored = score_drafts(
+        &pool,
+        final_drafts,
+        &archive_descriptors,
+        &spec.scoring,
+        guidance_state.as_ref(),
+    );
+    let guided_population_candidates = scored
+        .iter()
+        .filter(|candidate| candidate.guidance.is_some())
+        .count() as u64;
+    let guidance_scores = scored
+        .iter()
+        .filter_map(|candidate| {
+            candidate.guidance.as_ref().map(|guidance| {
+                (
+                    candidate.draft.semantic_fingerprint.clone(),
+                    guidance.conservative_outcome,
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
     let mut records = pool.install(|| {
         scored
             .par_iter()
             .map(|candidate| candidate_record(candidate, &run_id))
             .collect::<Vec<_>>()
     });
-    sort_records(&mut records);
+    sort_records_with_guidance(&mut records, &guidance_scores);
     let shortlist_deadline = started + deadline.saturating_sub(Duration::from_millis(25));
-    let candidates = diverse_shortlist(records, spec.shortlist_size, Some(shortlist_deadline));
+    let candidates = diverse_shortlist(
+        records,
+        spec.shortlist_size,
+        Some(shortlist_deadline),
+        &guidance_scores,
+    );
     let retained_transform_counts =
         transform_counts(candidates.iter().map(|candidate| candidate.provenance.kind));
     let content = candidate_content(&candidates)?;
@@ -503,6 +767,34 @@ pub fn run_search_with_options_and_catalog(
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         search_spec: spec.clone(),
         config_checksum: config_checksum.clone(),
+        measured_feedback: measured_feedback.clone(),
+        operator_policy: operator_policy_report
+            .as_ref()
+            .map(|report| OperatorPolicyProvenance {
+                configuration_checksum: digest(
+                    &serde_json::to_string(options.operator_policy.as_ref().unwrap_or_else(|| {
+                        unreachable!("a report exists only for a configured operator policy")
+                    }))
+                    .unwrap_or_default(),
+                ),
+                base_catalog_checksum: report.base_catalog_checksum.clone(),
+                adjusted_catalog_checksum: report.adjusted_catalog_checksum.clone(),
+                generation_weights: report.generation_weights.clone(),
+                transform_action_weights: transform_action_policy
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, TransformActionPolicy::audit_weights),
+                transform_action_source: if action_archive_checksum.is_some() {
+                    "external_action_archive".to_owned()
+                } else {
+                    "parent_archive".to_owned()
+                },
+                transform_action_archive_checksum: action_archive_checksum.clone(),
+            }),
+        guided_population_candidates,
+        seeded_from_archive: options.seed_from_archive,
+        frozen_seed_parents: options.freeze_seed_parents,
+        feedback_elite_parent_count: options.feedback_elite_parent_count,
+        catalog_scaffold_policy: options.catalog_scaffold_policy,
         archive_records: u64::try_from(archive_record_count).unwrap_or(u64::MAX),
         archive_accepted_records: archive_partition.accepted.len() as u64,
         archive_duplicate_records: archive_partition.duplicates.len() as u64,
@@ -542,6 +834,7 @@ pub fn run_search_with_options_and_catalog(
         &run_id,
         &config_checksum,
         &operator_catalog_checksum,
+        measured_feedback.as_ref(),
         generation,
         generations_completed,
         attempted,
@@ -583,8 +876,7 @@ fn validate_search_catalog(catalog: &Catalog) -> Result<(), SearchError> {
                 operator.name
             )));
         };
-        if operator.arity != reference.arity
-            || !inputs_compatible(&operator.inputs, &reference.inputs)
+        if !arity_and_inputs_compatible(operator, reference)
             || operator.required_input_kinds != reference.required_input_kinds
             || operator.output != reference.output
             || operator.commutative != reference.commutative
@@ -601,6 +893,30 @@ fn validate_search_catalog(catalog: &Catalog) -> Result<(), SearchError> {
     Ok(())
 }
 
+fn arity_and_inputs_compatible(
+    configured: &crate::operators::OperatorSpec,
+    reference: &crate::operators::OperatorSpec,
+) -> bool {
+    if configured.arity == reference.arity {
+        return inputs_compatible(&configured.inputs, &reference.inputs);
+    }
+    let configured_count = match configured.arity {
+        crate::Arity::Binary => 2,
+        crate::Arity::Exact { count } => count,
+        crate::Arity::Unary | crate::Arity::Variadic { .. } => return false,
+    };
+    let crate::Arity::Variadic { min, max } = reference.arity else {
+        return false;
+    };
+    (min..=max).contains(&configured_count)
+        && reference.inputs.len() == 1
+        && configured.inputs.len() == configured_count
+        && configured
+            .inputs
+            .iter()
+            .all(|input| input_compatible(input, &reference.inputs[0]))
+}
+
 fn inputs_compatible(
     configured: &[crate::operators::ArgumentSpec],
     reference: &[crate::operators::ArgumentSpec],
@@ -609,17 +925,21 @@ fn inputs_compatible(
         && configured
             .iter()
             .zip(reference)
-            .all(|(configured, reference)| {
-                configured.kinds == reference.kinds
-                    && match (&configured.domain, &reference.domain) {
-                        (left, right) if left == right => true,
-                        (
-                            crate::ValueDomain::WindowSet { values },
-                            crate::ValueDomain::Window { min, max },
-                        ) => values.iter().all(|value| (*min..=*max).contains(value)),
-                        _ => false,
-                    }
-            })
+            .all(|(configured, reference)| input_compatible(configured, reference))
+}
+
+fn input_compatible(
+    configured: &crate::operators::ArgumentSpec,
+    reference: &crate::operators::ArgumentSpec,
+) -> bool {
+    configured.kinds == reference.kinds
+        && match (&configured.domain, &reference.domain) {
+            (left, right) if left == right => true,
+            (crate::ValueDomain::WindowSet { values }, crate::ValueDomain::Window { min, max }) => {
+                values.iter().all(|value| (*min..=*max).contains(value))
+            }
+            _ => false,
+        }
 }
 
 fn validate_checkpoint(
@@ -627,6 +947,7 @@ fn validate_checkpoint(
     run_id: &str,
     config_checksum: &str,
     operator_catalog_checksum: &str,
+    measured_feedback: Option<&FeedbackProvenance>,
 ) -> Result<(), SearchError> {
     if checkpoint.schema != CHECKPOINT_SCHEMA {
         return Err(SearchError::Checkpoint(format!(
@@ -637,6 +958,7 @@ fn validate_checkpoint(
     if checkpoint.run_id != run_id
         || checkpoint.config_checksum != config_checksum
         || checkpoint.operator_catalog_checksum != operator_catalog_checksum
+        || checkpoint.measured_feedback.as_ref() != measured_feedback
     {
         return Err(SearchError::Checkpoint(
             "run, configuration, or operator catalog checksum changed".to_owned(),
@@ -651,6 +973,7 @@ fn persist_checkpoint(
     run_id: &str,
     config_checksum: &str,
     operator_catalog_checksum: &str,
+    measured_feedback: Option<&FeedbackProvenance>,
     next_generation: u64,
     generations_completed: u64,
     attempted_candidates: u64,
@@ -676,6 +999,7 @@ fn persist_checkpoint(
         run_id: run_id.to_owned(),
         config_checksum: config_checksum.to_owned(),
         operator_catalog_checksum: operator_catalog_checksum.to_owned(),
+        measured_feedback: measured_feedback.cloned(),
         next_generation,
         generations_completed,
         attempted_candidates,
@@ -768,6 +1092,95 @@ fn merge_prepared(
     }
 }
 
+fn transform_action_policy(
+    archive: &[CandidateRecord],
+    feedback: &FeedbackDataset,
+    config: &OperatorPolicyConfig,
+) -> TransformActionPolicy {
+    let evidence = feedback
+        .records
+        .iter()
+        .filter_map(|record| {
+            record
+                .semantic_fingerprint
+                .as_ref()
+                .map(|fingerprint| (fingerprint.as_str(), (record.outcome, record.confidence)))
+        })
+        .collect::<HashMap<_, _>>();
+    let global_weight = evidence
+        .values()
+        .map(|(_, confidence)| confidence)
+        .sum::<f64>();
+    let global_outcome = evidence
+        .values()
+        .map(|(outcome, confidence)| outcome * confidence)
+        .sum::<f64>()
+        / global_weight;
+    let adjusted = |name: &str, base: u16, matches: &dyn Fn(&CandidateRecord) -> bool| {
+        let measured = archive
+            .iter()
+            .filter(|record| matches(record))
+            .filter_map(|record| evidence.get(record.semantic_fingerprint.as_str()))
+            .collect::<Vec<_>>();
+        let centered = if measured.len() >= config.minimum_support {
+            let denominator = measured
+                .iter()
+                .map(|(_, confidence)| confidence)
+                .sum::<f64>();
+            measured
+                .iter()
+                .map(|(outcome, confidence)| outcome * confidence)
+                .sum::<f64>()
+                / denominator
+                - global_outcome
+        } else {
+            0.0
+        };
+        let normalized = (centered * 20.0).clamp(-1.0, 1.0);
+        let multiplier = (1.0 + config.strength * normalized)
+            .clamp(config.exploration_floor, config.maximum_multiplier);
+        let bounded = (f64::from(base) * f64::from(config.weight_scale) * multiplier)
+            .round()
+            .clamp(1.0, f64::from(u16::MAX));
+        format!("{bounded:.0}")
+            .parse::<u16>()
+            .unwrap_or_else(|_| panic!("bounded action weight for {name} must fit u16"))
+    };
+    let mutation_weight = adjusted("mutation", 1, &|record| {
+        record.provenance.kind == crate::TransformKind::Mutation
+    });
+    let crossover_weight = adjusted("crossover", 2, &|record| {
+        record.provenance.kind == crate::TransformKind::Crossover
+    });
+    let mutation_class_weights = MutationClass::ALL.map(|class| {
+        adjusted(class.operation(), 1, &|record| {
+            record.provenance.kind == crate::TransformKind::Mutation
+                && record.provenance.operation == class.operation()
+        })
+    });
+    TransformActionPolicy {
+        mutation_weight,
+        crossover_weight,
+        mutation_class_weights,
+    }
+}
+
+fn weighted_index(seed: u64, weights: &[u16]) -> usize {
+    let total = weights.iter().map(|weight| u64::from(*weight)).sum::<u64>();
+    let mut draw = seed % total;
+    weights
+        .iter()
+        .position(|weight| {
+            if draw < u64::from(*weight) {
+                true
+            } else {
+                draw -= u64::from(*weight);
+                false
+            }
+        })
+        .unwrap_or(0)
+}
+
 fn offspring(
     spec: &SearchSpec,
     generation: u64,
@@ -775,12 +1188,23 @@ fn offspring(
     ordinal: u64,
     parents: &[Draft],
     catalog: &Catalog,
+    action_policy: Option<&TransformActionPolicy>,
 ) -> (crate::Expr, Provenance) {
     if parents.is_empty() {
         let seed = offspring_seed(spec.seed, generation, slot, &[], "independent");
         return generate_with_catalog(seed, ordinal, &spec.limits, catalog);
     }
-    if slot.is_multiple_of(3) || parents.len() == 1 {
+    let mutation = action_policy.map_or_else(
+        || slot.is_multiple_of(3),
+        |policy| {
+            parents.len() == 1
+                || weighted_index(
+                    offspring_seed(spec.seed, generation, slot, &[], "action-kind"),
+                    &[policy.mutation_weight, policy.crossover_weight],
+                ) == 0
+        },
+    );
+    if mutation || parents.len() == 1 {
         let index = parent_index(slot, 17, generation, parents.len());
         let parent = &parents[index];
         let seed = offspring_seed(
@@ -790,7 +1214,22 @@ fn offspring(
             std::slice::from_ref(&parent.semantic_fingerprint),
             "mutation",
         );
-        mutate_with_catalog(&parent.expression, seed, ordinal, &spec.limits, catalog)
+        if let Some(policy) = action_policy {
+            let class_index = weighted_index(
+                offspring_seed(spec.seed, generation, slot, &[], "mutation-class"),
+                &policy.mutation_class_weights,
+            );
+            mutate_with_class_and_catalog(
+                &parent.expression,
+                MutationClass::ALL[class_index],
+                seed,
+                ordinal,
+                &spec.limits,
+                catalog,
+            )
+        } else {
+            mutate_with_catalog(&parent.expression, seed, ordinal, &spec.limits, catalog)
+        }
     } else {
         let left_index = parent_index(slot, 31, generation, parents.len());
         let mut right_index = parent_index(slot, 47, generation + 1, parents.len());
@@ -846,6 +1285,7 @@ fn score_drafts(
     drafts: &[Draft],
     archive_descriptors: &[StructuralDescriptor],
     scoring: &StructuralScoreConfig,
+    guidance: Option<&GuidanceState<'_>>,
 ) -> Vec<ScoredDraft> {
     let mut family_counts = HashMap::<String, usize>::new();
     let mut transform_counts = BTreeMap::<crate::TransformKind, usize>::new();
@@ -896,32 +1336,52 @@ fn score_drafts(
                     + weights.lineage_diversity * components.lineage_diversity
                     + weights.structural_novelty * components.structural_novelty
                     + weights.transform_diversity * components.transform_diversity;
-                ScoredDraft {
+                let mut scored = ScoredDraft {
                     draft: draft.clone(),
                     structural_score,
                     components,
                     weights,
+                    guidance: None,
+                };
+                if let Some(guidance) = guidance {
+                    let candidate = candidate_record(&scored, "guidance-estimate");
+                    scored.guidance = estimate_candidate_guidance_prevalidated(
+                        &candidate,
+                        guidance.dataset,
+                        guidance.config,
+                        guidance.checksum,
+                    );
                 }
+                scored
             })
             .collect::<Vec<_>>()
     });
-    scored.sort_by(|left, right| {
-        right
-            .structural_score
-            .total_cmp(&left.structural_score)
-            .then_with(|| {
-                left.draft
-                    .expression
-                    .node_count()
-                    .cmp(&right.draft.expression.node_count())
-            })
-            .then_with(|| {
-                left.draft
-                    .semantic_fingerprint
-                    .cmp(&right.draft.semantic_fingerprint)
-            })
-    });
+    scored.sort_by(compare_scored);
     scored
+}
+
+fn compare_scored(left: &ScoredDraft, right: &ScoredDraft) -> std::cmp::Ordering {
+    match (&left.guidance, &right.guidance) {
+        (Some(left), Some(right)) => right
+            .conservative_outcome
+            .total_cmp(&left.conservative_outcome)
+            .then_with(|| right.weighted_outcome.total_cmp(&left.weighted_outcome)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| right.structural_score.total_cmp(&left.structural_score))
+    .then_with(|| {
+        left.draft
+            .expression
+            .node_count()
+            .cmp(&right.draft.expression.node_count())
+    })
+    .then_with(|| {
+        left.draft
+            .semantic_fingerprint
+            .cmp(&right.draft.semantic_fingerprint)
+    })
 }
 
 fn nearest_descriptor_distance<'a>(
@@ -964,14 +1424,11 @@ fn diverse_elites(scored: Vec<ScoredDraft>, limit: usize) -> Vec<Draft> {
             .push_back(candidate);
     }
     let mut queues: Vec<_> = families.into_values().collect();
-    queues.sort_by(|left, right| {
-        let left_score = left
-            .front()
-            .map_or(f64::NEG_INFINITY, |item| item.structural_score);
-        let right_score = right
-            .front()
-            .map_or(f64::NEG_INFINITY, |item| item.structural_score);
-        right_score.total_cmp(&left_score)
+    queues.sort_by(|left, right| match (left.front(), right.front()) {
+        (Some(left), Some(right)) => compare_scored(left, right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
     let mut result = Vec::new();
     while result.len() < limit {
@@ -989,6 +1446,33 @@ fn diverse_elites(scored: Vec<ScoredDraft>, limit: usize) -> Vec<Draft> {
         }
     }
     result
+}
+
+fn feedback_elite_drafts(scored: &[ScoredDraft], count: usize) -> Vec<Draft> {
+    scored
+        .iter()
+        .filter(|candidate| candidate.guidance.is_some())
+        .take(count)
+        .map(|candidate| candidate.draft.clone())
+        .collect()
+}
+
+fn select_parent_pool(
+    feedback_elites: &[Draft],
+    diverse_population: &[Draft],
+    capacity: usize,
+) -> Vec<Draft> {
+    let mut selected = Vec::with_capacity(capacity);
+    let mut seen = HashSet::with_capacity(capacity);
+    for draft in feedback_elites.iter().chain(diverse_population) {
+        if selected.len() == capacity {
+            break;
+        }
+        if seen.insert(draft.semantic_fingerprint.clone()) {
+            selected.push(draft.clone());
+        }
+    }
+    selected
 }
 
 fn bounded_elite_archive(drafts: Vec<Draft>, limit: usize) -> Vec<Draft> {
@@ -1101,12 +1585,22 @@ fn transform_counts(
     counts
 }
 
-fn sort_records(records: &mut [CandidateRecord]) {
+fn sort_records_with_guidance(
+    records: &mut [CandidateRecord],
+    guidance_scores: &HashMap<String, f64>,
+) {
     records.sort_by(|left, right| {
-        right
-            .structural_score
-            .total_cmp(&left.structural_score)
-            .then_with(|| left.semantic_fingerprint.cmp(&right.semantic_fingerprint))
+        match (
+            guidance_scores.get(&left.semantic_fingerprint),
+            guidance_scores.get(&right.semantic_fingerprint),
+        ) {
+            (Some(left), Some(right)) => right.total_cmp(left),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| right.structural_score.total_cmp(&left.structural_score))
+        .then_with(|| left.semantic_fingerprint.cmp(&right.semantic_fingerprint))
     });
 }
 
@@ -1114,15 +1608,24 @@ fn diverse_shortlist(
     records: Vec<CandidateRecord>,
     limit: usize,
     deadline: Option<Instant>,
+    guidance_scores: &HashMap<String, f64>,
 ) -> Vec<CandidateRecord> {
+    let (mut scaffold, remaining): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|record| is_catalog_scaffold_operation(&record.provenance.operation));
+    sort_records_with_guidance(&mut scaffold, guidance_scores);
+    let scaffold_reserve = limit.div_ceil(2).min(scaffold.len());
+    let mut result = scaffold.drain(..scaffold_reserve).collect::<Vec<_>>();
     let mut families = BTreeMap::<(crate::TransformKind, u8), Vec<CandidateRecord>>::new();
-    for record in records {
+    // The reserved cover is a fixed evaluator-budget slice.  Do not let its
+    // unused tail re-enter the diversity rotation and crowd out learned or
+    // transformed candidates when the requested shortlist is small.
+    for record in remaining {
         families
             .entry((record.provenance.kind, node_bucket(record.nodes)))
             .or_default()
             .push(record);
     }
-    let mut result = Vec::new();
     let mut budget_exhausted = false;
     while result.len() < limit {
         if deadline.is_some_and(|value| Instant::now() >= value) {
@@ -1132,7 +1635,7 @@ fn diverse_shortlist(
         let mut progressed = false;
         for records in families.values_mut() {
             if !records.is_empty() && result.len() < limit {
-                let index = descriptor_aware_choice(records, &result);
+                let index = descriptor_aware_choice(records, &result, guidance_scores);
                 result.push(records.remove(index));
                 progressed = true;
             }
@@ -1142,7 +1645,7 @@ fn diverse_shortlist(
         }
     }
     if budget_exhausted {
-        fill_from_score_order(&mut result, families, limit);
+        fill_from_score_order(&mut result, families, limit, guidance_scores);
     }
     result
 }
@@ -1160,16 +1663,21 @@ fn fill_from_score_order(
     result: &mut Vec<CandidateRecord>,
     families: BTreeMap<(crate::TransformKind, u8), Vec<CandidateRecord>>,
     limit: usize,
+    guidance_scores: &HashMap<String, f64>,
 ) {
     if result.len() >= limit {
         return;
     }
     let mut remaining = families.into_values().flatten().collect::<Vec<_>>();
-    sort_records(&mut remaining);
+    sort_records_with_guidance(&mut remaining, guidance_scores);
     result.extend(remaining.into_iter().take(limit - result.len()));
 }
 
-fn descriptor_aware_choice(records: &[CandidateRecord], selected: &[CandidateRecord]) -> usize {
+fn descriptor_aware_choice(
+    records: &[CandidateRecord],
+    selected: &[CandidateRecord],
+    guidance_scores: &HashMap<String, f64>,
+) -> usize {
     let selected_stride = (selected.len() / 32).max(1);
     records
         .iter()
@@ -1184,19 +1692,30 @@ fn descriptor_aware_choice(records: &[CandidateRecord], selected: &[CandidateRec
                     .take(32)
                     .map(|candidate| &candidate.structural_descriptor),
             );
-            (index, record.structural_score + 0.35 * novelty)
+            let measured = guidance_scores.get(&record.semantic_fingerprint).copied();
+            let score = measured.map_or_else(
+                || record.structural_score + 0.35 * novelty,
+                |outcome| outcome + 0.05 * novelty,
+            );
+            (index, measured.is_some(), score)
         })
-        .max_by(|(left_index, left), (right_index, right)| {
-            left.total_cmp(right)
-                .then_with(|| right_index.cmp(left_index))
-        })
-        .map_or(0, |(index, _)| index)
+        .max_by(
+            |(left_index, left_guided, left), (right_index, right_guided, right)| {
+                left_guided
+                    .cmp(right_guided)
+                    .then_with(|| left.total_cmp(right))
+                    .then_with(|| right_index.cmp(left_index))
+            },
+        )
+        .map_or(0, |(index, _, _)| index)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Limits, SEARCH_SPEC_SCHEMA, StructuralScoreConfig, parse_expression};
+    use crate::{
+        FeedbackRecord, Limits, SEARCH_SPEC_SCHEMA, StructuralScoreConfig, parse_expression,
+    };
 
     fn spec(threads: usize) -> SearchSpec {
         SearchSpec {
@@ -1217,7 +1736,7 @@ mod tests {
         let semantic_fingerprint = analyze_expression(&expression).semantic_fingerprint;
         let (_, provenance) = generate_with_catalog(
             1,
-            1,
+            1_000,
             &Limits::default(),
             crate::operators::builtin_catalog(),
         );
@@ -1227,6 +1746,86 @@ mod tests {
             provenance,
             semantic_fingerprint,
             descriptor,
+        }
+    }
+
+    fn search_guidance() -> SearchGuidance {
+        SearchGuidance {
+            dataset: FeedbackDataset {
+                schema: crate::FEEDBACK_DATASET_SCHEMA,
+                dataset_id: "synthetic-search-guidance-v1".to_owned(),
+                context_checksum: "fixture-context".to_owned(),
+                outcome_label: "synthetic utility".to_owned(),
+                feature_scales: BTreeMap::from([
+                    ("depth".to_owned(), 10.0),
+                    ("nodes".to_owned(), 40.0),
+                ]),
+                records: vec![
+                    FeedbackRecord {
+                        record_id: "small".to_owned(),
+                        semantic_fingerprint: None,
+                        features: BTreeMap::from([
+                            ("depth".to_owned(), 1.0),
+                            ("nodes".to_owned(), 1.0),
+                        ]),
+                        outcome: -0.5,
+                        confidence: 1.0,
+                    },
+                    FeedbackRecord {
+                        record_id: "large".to_owned(),
+                        semantic_fingerprint: None,
+                        features: BTreeMap::from([
+                            ("depth".to_owned(), 6.0),
+                            ("nodes".to_owned(), 30.0),
+                        ]),
+                        outcome: 0.5,
+                        confidence: 1.0,
+                    },
+                ],
+            },
+            config: FeedbackConfig {
+                schema: 1,
+                neighbors: 1,
+                minimum_neighbors: 1,
+                maximum_distance: 1.0,
+            },
+        }
+    }
+
+    fn operator_policy_guidance() -> SearchGuidance {
+        let rows = [
+            ("mean-a", 0.0, 1.0, 0.8),
+            ("mean-b", 0.0, 1.0, 0.7),
+            ("mean-c", 0.0, 2.0, 0.6),
+            ("rank-a", 1.0, 0.0, -0.8),
+            ("rank-b", 1.0, 0.0, -0.7),
+            ("rank-c", 2.0, 0.0, -0.6),
+        ];
+        SearchGuidance {
+            dataset: FeedbackDataset {
+                schema: crate::FEEDBACK_DATASET_SCHEMA,
+                dataset_id: "synthetic-operator-policy-v1".to_owned(),
+                context_checksum: "operator-policy-context".to_owned(),
+                outcome_label: "synthetic operator reward".to_owned(),
+                feature_scales: BTreeMap::from([
+                    ("operator_rank_count".to_owned(), 1.0),
+                    ("operator_ts_mean_count".to_owned(), 1.0),
+                ]),
+                records: rows
+                    .into_iter()
+                    .map(|(id, rank, mean, outcome)| FeedbackRecord {
+                        record_id: id.to_owned(),
+                        semantic_fingerprint: None,
+                        features: BTreeMap::from([
+                            ("operator_rank_count".to_owned(), rank),
+                            ("operator_ts_mean_count".to_owned(), mean),
+                        ]),
+                        outcome,
+                        confidence: 1.0,
+                    })
+                    .collect(),
+            },
+            config: FeedbackConfig::default(),
         }
     }
 
@@ -1253,13 +1852,108 @@ mod tests {
     }
 
     #[test]
+    fn guided_search_is_deterministic_and_records_feedback_identity() {
+        let options = SearchRunOptions {
+            guidance: Some(search_guidance()),
+            ..SearchRunOptions::default()
+        };
+        let left = run_search_with_options(&spec(1), None, &options).unwrap();
+        let right = run_search_with_options(&spec(4), None, &options).unwrap();
+
+        assert_eq!(left.candidates, right.candidates);
+        assert_eq!(
+            left.manifest.candidate_content_checksum,
+            right.manifest.candidate_content_checksum
+        );
+        let provenance = left.manifest.measured_feedback.unwrap();
+        assert_eq!(provenance.dataset_id, "synthetic-search-guidance-v1");
+        assert_eq!(
+            provenance.feedback_checksum,
+            search_guidance().dataset.checksum()
+        );
+        assert!(left.manifest.guided_population_candidates > 0);
+    }
+
+    #[test]
+    fn outcome_aware_operator_policy_is_opt_in_deterministic_and_audited() {
+        let guidance = operator_policy_guidance();
+        let baseline = run_search_with_options(
+            &spec(1),
+            None,
+            &SearchRunOptions {
+                guidance: Some(guidance.clone()),
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap();
+        let options = SearchRunOptions {
+            guidance: Some(guidance),
+            operator_policy: Some(OperatorPolicyConfig::default()),
+            ..SearchRunOptions::default()
+        };
+        let one_thread = run_search_with_options(&spec(1), None, &options).unwrap();
+        let four_threads = run_search_with_options(&spec(4), None, &options).unwrap();
+
+        assert_eq!(one_thread.candidates, four_threads.candidates);
+        assert_ne!(
+            baseline.manifest.candidate_content_checksum,
+            one_thread.manifest.candidate_content_checksum
+        );
+        let provenance = one_thread.manifest.operator_policy.unwrap();
+        assert_ne!(
+            provenance.base_catalog_checksum,
+            provenance.adjusted_catalog_checksum
+        );
+        assert_eq!(
+            provenance.adjusted_catalog_checksum,
+            one_thread.manifest.operator_catalog_checksum
+        );
+    }
+
+    #[test]
+    fn outcome_aware_operator_policy_requires_feedback() {
+        let error = run_search_with_options(
+            &spec(1),
+            None,
+            &SearchRunOptions {
+                operator_policy: Some(OperatorPolicyConfig::default()),
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, SearchError::OperatorPolicyRequiresGuidance));
+    }
+
+    #[test]
+    fn seeded_catalog_scaffold_is_opt_in_and_recorded() {
+        let options = SearchRunOptions {
+            catalog_scaffold_policy: CatalogScaffoldPolicy::SeededDiverse,
+            ..SearchRunOptions::default()
+        };
+        let result = run_search_with_options(&spec(2), None, &options).unwrap();
+        assert_eq!(
+            result.manifest.catalog_scaffold_policy,
+            CatalogScaffoldPolicy::SeededDiverse
+        );
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.provenance.operation == crate::SEEDED_CATALOG_SCAFFOLD_OPERATION
+        }));
+    }
+
+    #[test]
     fn high_ranked_candidates_receive_selectable_descendants() {
         let candidates = vec![draft("close"), draft("rank(ts_mean(add(open, high), 20))")];
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap();
-        let scored = score_drafts(&pool, &candidates, &[], &StructuralScoreConfig::default());
+        let scored = score_drafts(
+            &pool,
+            &candidates,
+            &[],
+            &StructuralScoreConfig::default(),
+            None,
+        );
         let parents = diverse_elites(scored, 2);
         let highest = parents[0].semantic_fingerprint.clone();
         let mut found_descendant = false;
@@ -1271,6 +1965,7 @@ mod tests {
                 100 + slot,
                 &parents,
                 crate::operators::builtin_catalog(),
+                None,
             );
             if provenance.parent_fingerprints.contains(&highest) {
                 found_descendant = true;
@@ -1278,6 +1973,170 @@ mod tests {
             }
         }
         assert!(found_descendant);
+    }
+
+    #[test]
+    fn measured_feedback_overrides_structural_parent_order_without_changing_structural_scores() {
+        let candidates = vec![draft("close"), draft("rank(ts_mean(add(open, high), 20))")];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let structural = score_drafts(
+            &pool,
+            &candidates,
+            &[],
+            &StructuralScoreConfig::default(),
+            None,
+        );
+        assert_eq!(structural[0].draft.expression.operator(), None);
+        let structural_scores = structural
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.draft.semantic_fingerprint.clone(),
+                    candidate.structural_score,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let feedback_features = |candidate: &ScoredDraft| {
+            let record = candidate_record(candidate, "feedback-fixture");
+            let features = crate::candidate_features(&record);
+            BTreeMap::from([
+                ("depth".to_owned(), features["depth"]),
+                ("nodes".to_owned(), features["nodes"]),
+            ])
+        };
+        let simple = structural
+            .iter()
+            .find(|candidate| candidate.draft.expression.operator().is_none())
+            .unwrap();
+        let rich = structural
+            .iter()
+            .find(|candidate| candidate.draft.expression.operator() == Some("rank"))
+            .unwrap();
+        let dataset = FeedbackDataset {
+            schema: crate::FEEDBACK_DATASET_SCHEMA,
+            dataset_id: "synthetic-parent-guidance-v1".to_owned(),
+            context_checksum: "fixture-context".to_owned(),
+            outcome_label: "synthetic utility".to_owned(),
+            feature_scales: BTreeMap::from([
+                ("depth".to_owned(), 10.0),
+                ("nodes".to_owned(), 40.0),
+            ]),
+            records: vec![
+                FeedbackRecord {
+                    record_id: "simple".to_owned(),
+                    semantic_fingerprint: None,
+                    features: feedback_features(simple),
+                    outcome: -0.8,
+                    confidence: 1.0,
+                },
+                FeedbackRecord {
+                    record_id: "rich".to_owned(),
+                    semantic_fingerprint: None,
+                    features: feedback_features(rich),
+                    outcome: 0.8,
+                    confidence: 1.0,
+                },
+            ],
+        };
+        let config = FeedbackConfig {
+            schema: 1,
+            neighbors: 1,
+            minimum_neighbors: 1,
+            maximum_distance: 0.0,
+        };
+        dataset.validate().unwrap();
+        config.validate().unwrap();
+        let checksum = dataset.checksum();
+        let guidance = GuidanceState {
+            dataset: &dataset,
+            config: &config,
+            checksum: &checksum,
+        };
+        let guided = score_drafts(
+            &pool,
+            &candidates,
+            &[],
+            &StructuralScoreConfig::default(),
+            Some(&guidance),
+        );
+
+        assert_eq!(guided[0].draft.expression.operator(), Some("rank"));
+        assert!((guided[0].guidance.as_ref().unwrap().weighted_outcome - 0.8).abs() < f64::EPSILON);
+        assert!(guided.iter().all(|candidate| {
+            (candidate.structural_score - structural_scores[&candidate.draft.semantic_fingerprint])
+                .abs()
+                < f64::EPSILON
+        }));
+        let parents = diverse_elites(guided, 2);
+        assert_eq!(parents[0].expression.operator(), Some("rank"));
+    }
+
+    #[test]
+    fn feedback_elite_parent_reservation_precedes_diverse_fill_without_duplicates() {
+        let close = draft("close");
+        let open = draft("open");
+        let high = draft("high");
+        let low = draft("low");
+        let parents = select_parent_pool(
+            &[high.clone(), low.clone()],
+            &[close.clone(), high, open.clone()],
+            4,
+        );
+        assert_eq!(
+            parents
+                .iter()
+                .map(|parent| canonical(&parent.expression))
+                .collect::<Vec<_>>(),
+            vec!["high", "low", "close", "open"]
+        );
+    }
+
+    #[test]
+    fn feedback_elite_parent_reservation_requires_guidance_and_fits_capacity() {
+        let mut configured = spec(1);
+        configured.resources.parent_pool_capacity = 2;
+        let without_guidance = run_search_with_options(
+            &configured,
+            None,
+            &SearchRunOptions {
+                feedback_elite_parent_count: 1,
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            without_guidance,
+            SearchError::FeedbackEliteParentsRequireGuidance
+        ));
+
+        let over_capacity = run_search_with_options(
+            &configured,
+            None,
+            &SearchRunOptions {
+                guidance: Some(search_guidance()),
+                feedback_elite_parent_count: 3,
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            over_capacity,
+            SearchError::FeedbackEliteParentCountExceedsCapacity
+        ));
+    }
+
+    #[test]
+    fn guided_search_records_feedback_elite_parent_reservation() {
+        let options = SearchRunOptions {
+            guidance: Some(search_guidance()),
+            feedback_elite_parent_count: 4,
+            ..SearchRunOptions::default()
+        };
+        let result = run_search_with_options(&spec(1), None, &options).unwrap();
+        assert_eq!(result.manifest.feedback_elite_parent_count, 4);
     }
 
     #[test]
@@ -1296,6 +2155,7 @@ mod tests {
             &candidates,
             &[archive],
             &StructuralScoreConfig::default(),
+            None,
         );
         let near = scored
             .iter()
@@ -1328,13 +2188,38 @@ mod tests {
     }
 
     #[test]
+    fn shortlist_reserves_half_its_budget_for_catalog_scaffolds() {
+        let mut configured = spec(2);
+        configured.shortlist_size = 128;
+        let result = run_search(&configured, None).unwrap();
+        let scaffold = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.provenance.operation == crate::CATALOG_SCAFFOLD_OPERATION)
+            .collect::<Vec<_>>();
+        assert_eq!(scaffold.len(), 64);
+        let expressions = scaffold
+            .iter()
+            .map(|candidate| candidate.expression.as_str())
+            .collect::<HashSet<_>>();
+        for expression in [
+            "close",
+            "open",
+            "multiply(close, close)",
+            "multiply(open, open)",
+        ] {
+            assert!(expressions.contains(expression), "missing {expression}");
+        }
+    }
+
+    #[test]
     fn shortlist_preserves_competitive_node_buckets_within_a_transform() {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap();
         let seed = draft("close");
-        let scored = score_drafts(&pool, &[seed], &[], &StructuralScoreConfig::default());
+        let scored = score_drafts(&pool, &[seed], &[], &StructuralScoreConfig::default(), None);
         let base = candidate_record(&scored[0], "node-bucket-test");
         let records = [2, 8, 18, 35, 70, 120]
             .into_iter()
@@ -1349,7 +2234,7 @@ mod tests {
             })
             .collect();
 
-        let retained = diverse_shortlist(records, 6, None);
+        let retained = diverse_shortlist(records, 6, None, &HashMap::new());
         let buckets: HashSet<_> = retained
             .iter()
             .map(|record| node_bucket(record.nodes))
@@ -1364,7 +2249,7 @@ mod tests {
             .build()
             .unwrap();
         let seed = draft("close");
-        let scored = score_drafts(&pool, &[seed], &[], &StructuralScoreConfig::default());
+        let scored = score_drafts(&pool, &[seed], &[], &StructuralScoreConfig::default(), None);
         let base = candidate_record(&scored[0], "expired-budget-test");
         let records: Vec<_> = (0..12_usize)
             .map(|ordinal| {
@@ -1383,11 +2268,11 @@ mod tests {
         let expired = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
-        let retained = diverse_shortlist(records.clone(), 5, Some(expired));
+        let retained = diverse_shortlist(records.clone(), 5, Some(expired), &HashMap::new());
 
         assert_eq!(retained.len(), 5);
         let mut expected = records;
-        sort_records(&mut expected);
+        sort_records_with_guidance(&mut expected, &HashMap::new());
         assert_eq!(
             retained
                 .iter()
@@ -1400,7 +2285,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            diverse_shortlist(Vec::new(), 5, Some(expired)),
+            diverse_shortlist(Vec::new(), 5, Some(expired), &HashMap::new()),
             Vec::<CandidateRecord>::new()
         );
     }
@@ -1425,6 +2310,36 @@ mod tests {
     }
 
     #[test]
+    fn external_catalog_may_narrow_a_variadic_operator_to_fixed_arity() {
+        let mut catalog = crate::builtin_catalog().clone();
+        for name in ["add", "multiply"] {
+            let operator = catalog
+                .operators
+                .iter_mut()
+                .find(|operator| operator.name == name)
+                .unwrap();
+            let input = operator.inputs[0].clone();
+            operator.arity = crate::Arity::Binary;
+            operator.inputs = vec![input; 2];
+        }
+
+        validate_search_catalog(&catalog).unwrap();
+        let result = run_search_with_catalog(&spec(1), None, &catalog).unwrap();
+        assert!(result.candidates.iter().all(|candidate| {
+            parse_expression_with_catalog(&candidate.expression, &catalog).is_ok()
+        }));
+
+        let add = catalog
+            .operators
+            .iter_mut()
+            .find(|operator| operator.name == "add")
+            .unwrap();
+        add.arity = crate::Arity::Exact { count: 9 };
+        add.inputs = vec![add.inputs[0].clone(); 9];
+        assert!(validate_search_catalog(&catalog).is_err());
+    }
+
+    #[test]
     fn resident_archives_remain_bounded_as_attempts_grow() {
         let mut configured = spec(2);
         configured.max_candidates = 5_000;
@@ -1442,13 +2357,121 @@ mod tests {
     }
 
     #[test]
+    fn archive_seeding_generates_new_descendants_from_measured_parent_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("archive.jsonl");
+        let initial = run_search(&spec(1), None).unwrap();
+        crate::write_jsonl_atomic(&archive_path, &initial.candidates).unwrap();
+        let archive_ids = initial
+            .candidates
+            .iter()
+            .map(|candidate| candidate.semantic_fingerprint.clone())
+            .collect::<HashSet<_>>();
+        let mut continuation = spec(1);
+        continuation.max_candidates = 64;
+        let result = run_search_with_options(
+            &continuation,
+            Some(&archive_path),
+            &SearchRunOptions {
+                seed_from_archive: true,
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.manifest.seeded_from_archive);
+        assert_eq!(result.manifest.attempted_candidates, 64);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| !archive_ids.contains(&candidate.semantic_fingerprint))
+        );
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate
+                .provenance
+                .parent_fingerprints
+                .iter()
+                .any(|parent| archive_ids.contains(parent))
+        }));
+    }
+
+    #[test]
+    fn frozen_seed_parents_keep_every_descendant_attached_to_the_measured_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("archive.jsonl");
+        let initial = run_search(&spec(1), None).unwrap();
+        crate::write_jsonl_atomic(&archive_path, &initial.candidates).unwrap();
+        let archive_fingerprints = initial
+            .candidates
+            .iter()
+            .map(|candidate| candidate.semantic_fingerprint.clone())
+            .collect::<HashSet<_>>();
+        let mut continuation = spec(1);
+        continuation.max_candidates = 512;
+        let result = run_search_with_options(
+            &continuation,
+            Some(&archive_path),
+            &SearchRunOptions {
+                guidance: Some(search_guidance()),
+                seed_from_archive: true,
+                freeze_seed_parents: true,
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.manifest.seeded_from_archive);
+        assert!(result.manifest.frozen_seed_parents);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| { !candidate.provenance.parent_fingerprints.is_empty() })
+        );
+        assert!(result.candidates.iter().all(|candidate| {
+            candidate
+                .provenance
+                .parent_fingerprints
+                .iter()
+                .all(|parent| archive_fingerprints.contains(parent))
+        }));
+    }
+
+    #[test]
+    fn frozen_seed_parents_fail_closed_without_a_guided_archive() {
+        let error = run_search_with_options(
+            &spec(1),
+            None,
+            &SearchRunOptions {
+                freeze_seed_parents: true,
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::FrozenSeedParentsRequireGuidedArchive
+        ));
+    }
+
+    #[test]
     fn checkpoint_resume_matches_uninterrupted_fixed_budget() {
         let directory = tempfile::tempdir().unwrap();
         let checkpoint = directory.path().join("search.checkpoint.json");
         let mut configured = spec(2);
         configured.max_candidates = 1_000;
         configured.resources.elite_archive_capacity = 200;
-        let uninterrupted = run_search(&configured, None).unwrap();
+        let guidance = search_guidance();
+        let uninterrupted = run_search_with_options(
+            &configured,
+            None,
+            &SearchRunOptions {
+                guidance: Some(guidance.clone()),
+                ..SearchRunOptions::default()
+            },
+        )
+        .unwrap();
         let paused = run_search_with_options(
             &configured,
             None,
@@ -1456,6 +2479,13 @@ mod tests {
                 checkpoint_path: Some(checkpoint.clone()),
                 resume_from: None,
                 pause_after_generations: Some(3),
+                guidance: Some(guidance.clone()),
+                seed_from_archive: false,
+                freeze_seed_parents: false,
+                feedback_elite_parent_count: 0,
+                operator_policy: None,
+                operator_policy_action_archive: None,
+                catalog_scaffold_policy: CatalogScaffoldPolicy::Fixed,
             },
         )
         .unwrap();
@@ -1467,6 +2497,13 @@ mod tests {
                 checkpoint_path: Some(checkpoint.clone()),
                 resume_from: Some(checkpoint),
                 pause_after_generations: None,
+                guidance: Some(guidance),
+                seed_from_archive: false,
+                freeze_seed_parents: false,
+                feedback_elite_parent_count: 0,
+                operator_policy: None,
+                operator_policy_action_archive: None,
+                catalog_scaffold_policy: CatalogScaffoldPolicy::Fixed,
             },
         )
         .unwrap();
