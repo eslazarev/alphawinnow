@@ -21,14 +21,21 @@ jobs:
   cargo-audit:
     name: Rust (cargo audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      # Exit nonzero on vulnerabilities; do not create issues or check runs.
+      # Scheduled and PR audits keep the same read-only token permissions.
       - name: Audit the workspace lockfile
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --file Cargo.lock
 
   cargo-deny:
     name: Rust (cargo deny)
@@ -60,7 +67,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit the standalone comparison workspace
         working-directory: tools/radiate-selection-benchmark
