@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "dataset_id": "guide-synthetic-training-v1",
+  "context_checksum": "guide-synthetic-feedback-no-market-data",
+  "outcome_label": "toy bounded utility, not Sharpe or platform PASS",
+  "feature_scales": {"depth": 10.0, "nodes": 40.0},
+  "records": [
+    {"record_id": "train-a", "features": {"depth": 1.0, "nodes": 1.0}, "outcome": -0.8, "confidence": 1.0},
+    {"record_id": "train-b", "features": {"depth": 2.0, "nodes": 3.0}, "outcome": -0.2, "confidence": 1.0},
+    {"record_id": "train-c", "features": {"depth": 4.0, "nodes": 8.0}, "outcome": 0.6, "confidence": 1.0}
+  ]
+}

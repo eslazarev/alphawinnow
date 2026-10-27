@@ -446,7 +446,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, RecordBatch};
-    use parquet::arrow::ArrowWriter;
+    use parquet::{
+        arrow::ArrowWriter,
+        basic::{Compression, ZstdLevel},
+        file::properties::WriterProperties,
+    };
 
     use super::*;
 
@@ -466,6 +470,29 @@ mod tests {
 
     #[test]
     fn adapter_builds_dynamic_membership_without_hiding_realized_returns() {
+        let prepared = synthetic_panel(Compression::UNCOMPRESSED);
+        assert_eq!(
+            prepared.dataset.timestamps,
+            vec![20_200_102, 20_200_103, 20_200_106, 20_200_107]
+        );
+        assert_eq!(prepared.dataset.assets, vec!["A", "B", "C"]);
+        let row = 1;
+        let b = 1;
+        let index = row * 3 + b;
+        assert!(prepared.dataset.realized_returns.values[index].is_some());
+        assert!(prepared.dataset.fields["returns"].values[index].is_none());
+        assert_eq!(prepared.date_rows["20200106"], 2);
+    }
+
+    #[test]
+    fn zstd_compressed_panel_matches_uncompressed_values_and_membership() {
+        assert_eq!(
+            synthetic_panel(Compression::ZSTD(ZstdLevel::default())),
+            synthetic_panel(Compression::UNCOMPRESSED),
+        );
+    }
+
+    fn synthetic_panel(compression: Compression) -> PreparedPanel {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let daily_directory = root.join("daily/partition_year=2020");
@@ -500,6 +527,7 @@ mod tests {
                 ),
             ])
             .unwrap(),
+            compression,
         );
         let prices = vec![
             100.0, 100.0, 100.0, 101.0, 102.0, 103.0, 102.0, 104.0, 106.0, 103.0, 106.0, 109.0,
@@ -532,31 +560,24 @@ mod tests {
                 ),
             ])
             .unwrap(),
+            compression,
         );
-        let prepared = prepare_sharadar_panel(&SharadarPanelConfig {
+        prepare_sharadar_panel(&SharadarPanelConfig {
             parquet_root: root.to_owned(),
             start_date: dates[0],
             end_date: dates[3],
             universe_size: 2,
             dataset_id: "synthetic-parquet-panel-v1".to_owned(),
         })
-        .unwrap();
-        assert_eq!(
-            prepared.dataset.timestamps,
-            vec![20_200_102, 20_200_103, 20_200_106, 20_200_107]
-        );
-        assert_eq!(prepared.dataset.assets, vec!["A", "B", "C"]);
-        let row = 1;
-        let b = 1;
-        let index = row * 3 + b;
-        assert!(prepared.dataset.realized_returns.values[index].is_some());
-        assert!(prepared.dataset.fields["returns"].values[index].is_none());
-        assert_eq!(prepared.date_rows["20200106"], 2);
+        .unwrap()
     }
 
-    fn write_batch(path: &Path, batch: &RecordBatch) {
+    fn write_batch(path: &Path, batch: &RecordBatch, compression: Compression) {
         let file = File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        let properties = WriterProperties::builder()
+            .set_compression(compression)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(properties)).unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
     }

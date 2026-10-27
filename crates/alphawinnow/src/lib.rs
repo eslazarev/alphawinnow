@@ -8,6 +8,8 @@ pub mod dedup;
 pub mod dialect;
 pub mod engine;
 pub mod feedback;
+pub mod field_diversity;
+pub mod identity_reduction;
 pub mod measured_search;
 pub mod novelty;
 #[cfg(feature = "numeric-evidence")]
@@ -24,8 +26,8 @@ pub use artifact::{
     ArtifactError, CANDIDATE_SCHEMA, CHECKPOINT_SCHEMA, CandidateRecord, CheckpointDraft,
     FeedbackProvenance, MANIFEST_SCHEMA, OperatorPolicyProvenance, PublicationPointer,
     RunCheckpoint, RunManifest, StructuralScoreComponents, publication_pointer_path,
-    read_candidates, read_checkpoint, read_published_run, write_checkpoint_atomic,
-    write_jsonl_atomic, write_manifest_atomic, write_run_transactional,
+    read_candidates, read_candidates_with_checksum, read_checkpoint, read_published_run,
+    write_checkpoint_atomic, write_jsonl_atomic, write_manifest_atomic, write_run_transactional,
 };
 pub use ast::{Expr, ExprKind};
 pub use canonical::{canonical, fingerprint, semantic_canonical, semantic_fingerprint};
@@ -41,11 +43,13 @@ pub use engine::{
     run_search_with_catalog, run_search_with_options, run_search_with_options_and_catalog,
 };
 pub use feedback::{
-    FEEDBACK_DATASET_SCHEMA, FeedbackAuditReport, FeedbackConfig, FeedbackDataset, FeedbackError,
-    FeedbackRecord, GUIDED_CANDIDATE_SCHEMA, GuidanceEstimate, GuidedCandidate,
-    OPERATOR_POLICY_SCHEMA, OperatorPolicyConfig, OperatorPolicyReport, audit_feedback,
-    candidate_features, prioritize_candidates, reweight_operator_catalog,
-    write_guided_jsonl_atomic,
+    FEEDBACK_DATASET_SCHEMA, FeedbackAdmission, FeedbackAuditReport, FeedbackConfig,
+    FeedbackDataset, FeedbackError, FeedbackHoldoutReport, FeedbackPrediction, FeedbackRecord,
+    FeedbackScreenReport, GUIDED_CANDIDATE_SCHEMA, GuidanceEstimate, GuidedCandidate,
+    OPERATOR_POLICY_SCHEMA, OperatorPolicyConfig, OperatorPolicyReport, ScreenedCandidate,
+    audit_feedback, audit_feedback_holdout, candidate_features, prioritize_candidates,
+    reweight_operator_catalog, screen_candidates, write_feedback_screen_atomic,
+    write_feedback_screen_jsonl_atomic, write_guided_jsonl_atomic,
 };
 pub use novelty::{
     StructuralDescriptor, common_ancestor_depth, describe, describe_with_catalog,
@@ -76,8 +80,9 @@ pub use transform::{
     validate_transformed_with_catalog,
 };
 pub use tree::{
-    ExprPath, KindSet, PathEntry, PathError, PathSegment, allowed_kinds, enumerate_paths,
-    replace_subtree, subtree_at,
+    ExprPath, KindSet, PathEntry, PathError, PathSegment, allowed_kinds,
+    allowed_kinds_with_catalog, enumerate_paths, enumerate_paths_with_catalog, replace_subtree,
+    replace_subtree_with_catalog, subtree_at,
 };
 
 use serde::{Deserialize, Serialize};

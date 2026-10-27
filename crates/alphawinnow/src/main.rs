@@ -1,13 +1,19 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use alphawinnow::{
     Catalog, CatalogScaffoldPolicy, DialectSpec, FeedbackConfig, FeedbackDataset, Limits,
     OperatorPolicyConfig, ResourceLimits, SEARCH_SPEC_SCHEMA, SearchGuidance, SearchRunOptions,
-    SearchSpec, StructuralScoreConfig, analyze_expression, audit_feedback, builtin_catalog,
-    canonical, compile_dialect, deduplicate, fingerprint, parse_expression,
-    parse_expression_with_catalog, prioritize_candidates, read_candidates, run_search,
-    run_search_with_options, run_search_with_options_and_catalog, write_guided_jsonl_atomic,
-    write_jsonl_atomic, write_run_transactional,
+    SearchSpec, StructuralScoreConfig, analyze_expression, audit_feedback, audit_feedback_holdout,
+    builtin_catalog, canonical, compile_dialect, deduplicate, fingerprint, parse_expression,
+    parse_expression_with_catalog, prioritize_candidates, read_candidates,
+    read_candidates_with_checksum, run_search, run_search_with_options,
+    run_search_with_options_and_catalog, screen_candidates, write_feedback_screen_atomic,
+    write_feedback_screen_jsonl_atomic, write_guided_jsonl_atomic, write_jsonl_atomic,
+    write_run_transactional,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,7 +52,9 @@ enum Command {
     Benchmark(BenchmarkArgs),
     /// Prioritize candidate JSONL using separate immutable measured feedback.
     Prioritize(PrioritizeArgs),
-    /// Audit measured feedback with leave-one-record-out guidance.
+    /// Screen candidates with an explicit feedback threshold; retain all decisions.
+    ScreenFeedback(ScreenFeedbackArgs),
+    /// Audit measured feedback with leave-one-out or separate held-out evaluation.
     AuditFeedback(AuditFeedbackArgs),
     /// Lower and lint one expression against an immutable target dialect.
     Compile(CompileArgs),
@@ -229,7 +237,7 @@ struct PrioritizeArgs {
     /// Immutable schema-1 measured-feedback JSON.
     #[arg(long)]
     feedback: PathBuf,
-    /// Atomic guided-candidate JSONL output.
+    /// Atomic output: guided JSONL for prioritize; JSON report for screen-feedback.
     #[arg(long)]
     output: PathBuf,
     /// Maximum nearest neighbors used for one estimate.
@@ -244,10 +252,33 @@ struct PrioritizeArgs {
 }
 
 #[derive(Debug, Args)]
+struct ScreenFeedbackArgs {
+    #[command(flatten)]
+    prioritize: PrioritizeArgs,
+    /// Minimum heuristic conservative outcome in label units [-1, 1].
+    /// No automatic fallback when every candidate is rejected.
+    #[arg(long, allow_hyphen_values = true)]
+    minimum_conservative_outcome: f64,
+    /// JSON report or JSONL metadata header followed by individual decisions.
+    #[arg(long, value_enum, default_value_t = ScreenFormat::Json)]
+    format: ScreenFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScreenFormat {
+    Json,
+    Jsonl,
+}
+
+#[derive(Debug, Args)]
 struct AuditFeedbackArgs {
     /// Immutable schema-1 measured-feedback JSON.
     #[arg(long)]
     feedback: PathBuf,
+    /// Separate evaluation dataset; known identity overlap and context mismatch fail.
+    /// The caller must also split by time/family; without this, use leave-one-out.
+    #[arg(long)]
+    evaluation_feedback: Option<PathBuf>,
     /// Maximum nearest neighbors used for one estimate.
     #[arg(long, default_value_t = 8)]
     neighbors: usize,
@@ -408,6 +439,7 @@ fn main() -> Result<()> {
         Command::Search(args) => search(&args),
         Command::Benchmark(args) => benchmark(&args),
         Command::Prioritize(args) => prioritize(&args),
+        Command::ScreenFeedback(args) => screen_feedback(&args),
         Command::AuditFeedback(args) => audit_feedback_command(&args),
         Command::Compile(args) => compile_command(&args),
         #[cfg(feature = "numeric-evidence")]
@@ -430,19 +462,69 @@ fn compile_command(args: &CompileArgs) -> Result<()> {
     Ok(())
 }
 
+fn load_feedback(path: &Path) -> Result<FeedbackDataset> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("cannot read feedback {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid measured-feedback JSON {}", path.display()))
+}
+
 fn audit_feedback_command(args: &AuditFeedbackArgs) -> Result<()> {
-    let bytes = std::fs::read(&args.feedback)
-        .with_context(|| format!("cannot read feedback {}", args.feedback.display()))?;
-    let feedback: FeedbackDataset =
-        serde_json::from_slice(&bytes).context("invalid measured-feedback JSON")?;
+    let feedback = load_feedback(&args.feedback)?;
     let config = FeedbackConfig {
         schema: 1,
         neighbors: args.neighbors,
         minimum_neighbors: args.minimum_neighbors,
         maximum_distance: args.maximum_distance,
     };
-    let report = audit_feedback(&feedback, &config).context("feedback audit failed")?;
-    println!("{}", serde_json::to_string(&report)?);
+    if let Some(path) = &args.evaluation_feedback {
+        let evaluation = load_feedback(path)?;
+        let report = audit_feedback_holdout(&feedback, &evaluation, &config)
+            .context("held-out feedback audit failed")?;
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        let report = audit_feedback(&feedback, &config).context("feedback audit failed")?;
+        println!("{}", serde_json::to_string(&report)?);
+    }
+    Ok(())
+}
+
+fn screen_feedback(args: &ScreenFeedbackArgs) -> Result<()> {
+    let paths = &args.prioritize;
+    refuse_same_path(&paths.input, &paths.output)?;
+    refuse_same_path(&paths.feedback, &paths.output)?;
+    let (candidates, input_checksum) =
+        read_candidates_with_checksum(&paths.input).context("cannot read candidate input")?;
+    let feedback = load_feedback(&paths.feedback)?;
+    let config = FeedbackConfig {
+        schema: 1,
+        neighbors: paths.neighbors,
+        minimum_neighbors: paths.minimum_neighbors,
+        maximum_distance: paths.maximum_distance,
+    };
+    let mut report = screen_candidates(
+        &candidates,
+        &feedback,
+        &config,
+        args.minimum_conservative_outcome,
+    )
+    .context("feedback screening failed")?;
+    report.input_file_checksum = Some(input_checksum);
+    let checksum = match args.format {
+        ScreenFormat::Json => write_feedback_screen_atomic(&paths.output, &report),
+        ScreenFormat::Jsonl => write_feedback_screen_jsonl_atomic(&paths.output, &report),
+    }
+    .context("cannot write screening report")?;
+    println!(
+        "{}",
+        json!({
+            "schema": 1,
+            "eligible_records": report.eligible_records,
+            "rejected_records": report.rejected_records,
+            "content_checksum": checksum,
+            "output": paths.output,
+        })
+    );
     Ok(())
 }
 
@@ -450,10 +532,7 @@ fn prioritize(args: &PrioritizeArgs) -> Result<()> {
     refuse_same_path(&args.input, &args.output)?;
     refuse_same_path(&args.feedback, &args.output)?;
     let candidates = read_candidates(&args.input).context("cannot read candidate input")?;
-    let bytes = std::fs::read(&args.feedback)
-        .with_context(|| format!("cannot read feedback {}", args.feedback.display()))?;
-    let feedback: FeedbackDataset =
-        serde_json::from_slice(&bytes).context("invalid measured-feedback JSON")?;
+    let feedback = load_feedback(&args.feedback)?;
     let config = FeedbackConfig {
         schema: 1,
         neighbors: args.neighbors,

@@ -1,0 +1,4 @@
+[
+  {"record_id": "toy-seed-a", "expression": "rank(close)", "outcome": -0.1},
+  {"record_id": "toy-seed-b", "expression": "ts_mean(volume, 20)", "outcome": -0.1}
+]

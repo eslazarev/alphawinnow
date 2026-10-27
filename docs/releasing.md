@@ -29,7 +29,7 @@ source or manifests is a publishing action; do not merge just to rehearse.
 
 ### Preparing an explicit version
 
-For a planned breaking release such as 0.2.0, update `[workspace.package].version`
+For a planned breaking release such as 0.3.0, update `[workspace.package].version`
 and the `alphawinnow` entry in `Cargo.lock` together in the PR. Add a changelog
 entry and `docs/releases/<version>.md`; the workflow appends these version-specific
 notes to the GitHub release. Keep Homebrew/Scoop manifests unchanged until actual
@@ -37,7 +37,7 @@ release archives and checksums exist.
 
 In `auto` mode, `bump-version.sh` preserves a manifest version greater than the
 last reachable `v*` tag and verifies its lockfile with `cargo metadata --locked`.
-It does not increment a prepared 0.2.0 to 0.2.1, nor create an empty bump commit.
+It does not increment a prepared 0.3.0 to 0.3.1, nor create an empty bump commit.
 A version behind the last release fails. Explicit `patch`/`minor`/`major` still
 increment the manifest, so choose `auto` to publish a prepared version.
 
@@ -54,6 +54,7 @@ cargo test --workspace --no-default-features --locked
 cargo +1.92.0 check --workspace --all-targets --all-features --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
 cargo run --example measured_search --no-default-features --locked
+cargo run --example adaptive_measured_search --no-default-features --locked
 cargo package -p alphawinnow --list --locked
 cargo publish --workspace --dry-run --locked
 ```
@@ -103,11 +104,11 @@ into the default branch's cache scope.
 A tag pushed by hand still releases exactly that tag and raises nothing:
 
 ```bash
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "v0.3.0"
+git push origin v0.3.0
 ```
 
-That path requires `version = "0.2.0"` to already be in the manifest; the
+That path requires `version = "0.3.0"` to already be in the manifest; the
 `verify` job fails the release if the tag and the manifest disagree, before
 anything is built or uploaded.
 

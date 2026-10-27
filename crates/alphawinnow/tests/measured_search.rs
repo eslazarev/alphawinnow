@@ -1,8 +1,25 @@
 use alphawinnow::measured_search::{
     MeasuredExploration, MeasuredMutation, MeasuredOutcome, MeasuredParentSelection,
-    MeasuredSearchConfig, MeasuredSearchSession,
+    MeasuredProposal, MeasuredSearchConfig, MeasuredSearchSession,
 };
 use alphawinnow::{Limits, builtin_catalog};
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn external_outcome_json_preserves_finite_bits(bits in any::<u64>()) {
+        let value = f64::from_bits(bits);
+        prop_assume!(value.is_finite());
+        let original = MeasuredOutcome {
+            semantic_fingerprint: "synthetic-serialization-test".to_owned(),
+            outcome: value,
+        };
+        let encoded = serde_json::to_string(&original).unwrap();
+        let restored: MeasuredOutcome = serde_json::from_str(&encoded).unwrap();
+        prop_assert_eq!(restored.outcome.to_bits(), bits);
+        prop_assert_eq!(restored.semantic_fingerprint, original.semantic_fingerprint);
+    }
+}
 
 fn config() -> MeasuredSearchConfig {
     MeasuredSearchConfig {
@@ -22,6 +39,123 @@ fn config() -> MeasuredSearchConfig {
 
 fn session() -> MeasuredSearchSession {
     MeasuredSearchSession::new(config(), builtin_catalog().clone()).unwrap()
+}
+
+#[test]
+fn json_checkpoint_round_trip_preserves_finite_outcome_bits() {
+    let cfg = config();
+    let catalog = builtin_catalog().clone();
+    let mut original = MeasuredSearchSession::new(cfg.clone(), catalog.clone()).unwrap();
+    let proposals = original.ask().unwrap();
+    for value in [
+        0.029_358_551_875_080_758_f64,
+        0.027_007_301_935_505_726,
+        0.020_855_982_990_714_006,
+        0.000_985_977_915_838_431_9,
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        f64::MIN,
+    ] {
+        let mut trial = original.clone();
+        let scores: Vec<_> = proposals
+            .iter()
+            .map(|p| MeasuredOutcome {
+                semantic_fingerprint: p.semantic_fingerprint.clone(),
+                outcome: value,
+            })
+            .collect();
+        trial
+            .tell("synthetic-v1", "fixed-objective", &scores)
+            .unwrap();
+        let checkpoint = trial.checkpoint_json().unwrap();
+        let mut restored =
+            MeasuredSearchSession::from_checkpoint_json(&checkpoint, cfg.clone(), catalog.clone())
+                .unwrap();
+        let stored = restored.checkpoint_value().unwrap()["parents"][0]["outcome"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(stored.to_bits(), value.to_bits(), "outcome {value}");
+        assert_eq!(restored.checkpoint_json().unwrap(), checkpoint);
+        assert_eq!(restored.ask().unwrap(), trial.ask().unwrap());
+    }
+}
+
+#[test]
+fn checkpoint_rejects_missing_snapshot_parents() {
+    for selection in [
+        MeasuredParentSelection::Score,
+        MeasuredParentSelection::Uniform,
+        MeasuredParentSelection::ScoreDiverseV1,
+    ] {
+        let mut cfg = config();
+        cfg.parent_capacity = 4;
+        cfg.parent_selection = selection;
+        let catalog = builtin_catalog().clone();
+        let mut session = MeasuredSearchSession::new(cfg.clone(), catalog.clone()).unwrap();
+        session.ask().unwrap();
+        session
+            .tell("synthetic-v1", "pool", &outcomes(&session, 1.))
+            .unwrap();
+        for keep in [0, 3] {
+            let mut broken = session.checkpoint_value().unwrap();
+            broken["parents"].as_array_mut().unwrap().truncate(keep);
+            assert!(
+                MeasuredSearchSession::from_checkpoint_json(
+                    &broken.to_string(),
+                    cfg.clone(),
+                    catalog.clone()
+                )
+                .is_err(),
+                "accepted missing parents for {selection:?}: kept {keep}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checkpoint_accepts_unfilled_capacity_and_short_final_batch_for_every_policy() {
+    for selection in [
+        MeasuredParentSelection::Score,
+        MeasuredParentSelection::Uniform,
+        MeasuredParentSelection::ScoreDiverseV1,
+        MeasuredParentSelection::LatestBatchScoreV1,
+        MeasuredParentSelection::LatestBatchUniformV1,
+    ] {
+        let mut cfg = config();
+        cfg.max_evaluations = 3;
+        cfg.batch_size = 2;
+        cfg.parent_capacity = 4;
+        cfg.parent_selection = selection;
+        let catalog = builtin_catalog().clone();
+        let mut session = MeasuredSearchSession::new(cfg.clone(), catalog.clone()).unwrap();
+        for _ in 0..2 {
+            let pending = session.ask().unwrap();
+            let mut restored = MeasuredSearchSession::from_checkpoint_json(
+                &session.checkpoint_json().unwrap(),
+                cfg.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+            assert_eq!(restored.ask().unwrap(), pending);
+            session
+                .tell("synthetic-v1", "pool", &outcomes(&session, 1.))
+                .unwrap();
+            let checkpoint = session.checkpoint_json().unwrap();
+            let restored = MeasuredSearchSession::from_checkpoint_json(
+                &checkpoint,
+                cfg.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+            assert_eq!(restored.checkpoint_json().unwrap(), checkpoint);
+        }
+        assert_eq!(session.measured(), 3);
+        assert_eq!(session.ask().unwrap(), [] as [MeasuredProposal; 0]);
+    }
 }
 
 #[test]
@@ -514,7 +648,7 @@ fn measured_scores_choose_parents_and_change_descendants() {
     let mut right = session();
     let initial = left.ask().unwrap();
     assert_eq!(right.ask().unwrap(), initial);
-    assert!(left.parents().is_empty());
+    assert_eq!(left.parents(), [] as [MeasuredProposal; 0]);
     left.tell("synthetic-v1", "pool-0", &outcomes(&left, 1.0))
         .unwrap();
     let other_parent = initial

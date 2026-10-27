@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -210,17 +211,38 @@ pub enum ArtifactError {
 /// # Errors
 /// Returns an error for I/O failures, malformed JSON, or unsupported schemas.
 pub fn read_candidates(path: &Path) -> Result<Vec<CandidateRecord>, ArtifactError> {
+    read_candidates_with_checksum(path).map(|(records, _)| records)
+}
+
+/// Read candidates and SHA-256 the exact same input bytes, including blank lines.
+///
+/// # Errors
+/// Returns an error for I/O failures, malformed JSON, or unsupported schemas.
+pub fn read_candidates_with_checksum(
+    path: &Path,
+) -> Result<(Vec<CandidateRecord>, String), ArtifactError> {
     let file = File::open(path).map_err(|source| ArtifactError::Read {
         path: path.to_owned(),
         source,
     })?;
     let mut records = Vec::new();
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line_number = index + 1;
-        let line = line.map_err(|source| ArtifactError::Read {
-            path: path.to_owned(),
-            source,
-        })?;
+    let mut reader = BufReader::new(file);
+    let mut checksum = Sha256::new();
+    let mut line = String::new();
+    let mut line_number = 0;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|source| ArtifactError::Read {
+                path: path.to_owned(),
+                source,
+            })?;
+        if bytes == 0 {
+            break;
+        }
+        line_number += 1;
+        checksum.update(line.as_bytes());
         if line.trim().is_empty() {
             continue;
         }
@@ -239,7 +261,7 @@ pub fn read_candidates(path: &Path) -> Result<Vec<CandidateRecord>, ArtifactErro
         }
         records.push(record);
     }
-    Ok(records)
+    Ok((records, format!("{:x}", checksum.finalize())))
 }
 
 /// Serialize records exactly as they will appear in JSONL.
@@ -536,6 +558,13 @@ fn write_new_file(path: &Path, content: &[u8]) -> Result<(), std::io::Error> {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ArtifactError> {
+    atomic_write_with(path, |file| file.write_all(content))
+}
+
+pub(crate) fn atomic_write_with<T>(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<T>,
+) -> Result<T, ArtifactError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -543,26 +572,25 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ArtifactEr
         ".{file_name}.{}.{sequence}.tmp",
         std::process::id()
     ));
-    let result = (|| -> Result<(), std::io::Error> {
+    let result = (|| -> Result<T, std::io::Error> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(content)?;
+        let value = write(&mut file)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
         let _ = sync_directory(parent);
-        Ok(())
+        Ok(value)
     })();
-    if let Err(source) = result {
+    result.map_err(|source| {
         let _ = fs::remove_file(&temporary);
-        return Err(ArtifactError::Write {
+        ArtifactError::Write {
             path: path.to_owned(),
             source,
-        });
-    }
-    Ok(())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -571,6 +599,36 @@ mod tests {
 
     use super::*;
     use crate::transform::{Provenance, TransformKind};
+
+    #[test]
+    fn candidate_checksum_covers_exact_parsed_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("records.jsonl");
+        let line = serde_json::to_string(&record("close")).unwrap();
+        let mut previous = None;
+        for content in [format!("{line}\n"), format!("\r\n{line}\r\n\n"), line] {
+            fs::write(&path, &content).unwrap();
+            let (records, checksum) = read_candidates_with_checksum(&path).unwrap();
+            assert_eq!(records, vec![record("close")]);
+            assert_eq!(checksum, digest(&content));
+            assert_ne!(previous.as_ref(), Some(&checksum));
+            previous = Some(checksum);
+        }
+    }
+
+    #[test]
+    fn failed_stream_write_preserves_previous_artifact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("artifact.jsonl");
+        fs::write(&path, "original").unwrap();
+        let result: Result<(), _> = atomic_write_with(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     fn record(expression: &str) -> CandidateRecord {
         CandidateRecord {

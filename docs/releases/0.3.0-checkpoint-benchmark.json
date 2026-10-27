@@ -1,0 +1,61 @@
+{
+  "arch": "aarch64",
+  "comparison": "same current implementation; not a comparison against the previous release",
+  "exclusions": 100000,
+  "history_bytes": 6700001,
+  "history_checksum": "695fb812c3caf62102814fa21e832e8a065a36ba6ae9a7ab75658d505282cd36",
+  "history_load_us": 46486,
+  "initialization_us": 28274,
+  "os": "macos",
+  "package_version": "0.3.0",
+  "profile": "release",
+  "schema": 1,
+  "timing_scope": "in-memory serialization and validation; excludes disk I/O and compilation",
+  "trials": [
+    {
+      "referenced_bytes": 6542,
+      "referenced_restore_us": 134,
+      "referenced_write_us": 15,
+      "standalone_bytes": 6706435,
+      "standalone_restore_us": 46100,
+      "standalone_write_us": 3431,
+      "state_and_pending_parity": true
+    },
+    {
+      "referenced_bytes": 6542,
+      "referenced_restore_us": 137,
+      "referenced_write_us": 34,
+      "standalone_bytes": 6706435,
+      "standalone_restore_us": 46215,
+      "standalone_write_us": 3563,
+      "state_and_pending_parity": true
+    },
+    {
+      "referenced_bytes": 6542,
+      "referenced_restore_us": 112,
+      "referenced_write_us": 14,
+      "standalone_bytes": 6706435,
+      "standalone_restore_us": 45267,
+      "standalone_write_us": 3649,
+      "state_and_pending_parity": true
+    },
+    {
+      "referenced_bytes": 6542,
+      "referenced_restore_us": 129,
+      "referenced_write_us": 24,
+      "standalone_bytes": 6706435,
+      "standalone_restore_us": 44774,
+      "standalone_write_us": 3474,
+      "state_and_pending_parity": true
+    },
+    {
+      "referenced_bytes": 6542,
+      "referenced_restore_us": 134,
+      "referenced_write_us": 16,
+      "standalone_bytes": 6706435,
+      "standalone_restore_us": 44795,
+      "standalone_write_us": 3341,
+      "state_and_pending_parity": true
+    }
+  ]
+}

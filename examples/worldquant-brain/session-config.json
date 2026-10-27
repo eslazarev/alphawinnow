@@ -1,0 +1,13 @@
+{
+  "seed": 7,
+  "limits": {"max_depth": 6, "max_nodes": 40, "max_operators": 16, "min_window": 2, "max_window": 60, "max_scalar_abs": 1000},
+  "max_evaluations": 32,
+  "max_attempts": 2000,
+  "batch_size": 8,
+  "parent_capacity": 2,
+  "exploration_every": 4,
+  "exploration_policy": "grammar",
+  "mutation_policy": "applicable",
+  "parent_selection": "score",
+  "evaluator_context": "guide-toy-call-count-v1-no-market-data"
+}

@@ -105,6 +105,15 @@ pub enum PathError {
 /// Enumerate the root, every positional argument, and every keyword slot.
 #[must_use]
 pub fn enumerate_paths(expression: &Expr) -> Vec<PathEntry> {
+    enumerate_paths_with_catalog(expression, operators::builtin_catalog())
+}
+
+/// Enumerate typed slots using the same catalog that was used to parse the tree.
+#[must_use]
+pub fn enumerate_paths_with_catalog(
+    expression: &Expr,
+    catalog: &operators::Catalog,
+) -> Vec<PathEntry> {
     let mut entries = Vec::new();
     let root = ExprPath::default();
     enumerate(
@@ -112,6 +121,7 @@ pub fn enumerate_paths(expression: &Expr) -> Vec<PathEntry> {
         &root,
         KindSet::singleton(expression.kind()),
         &mut entries,
+        catalog,
     );
     entries
 }
@@ -121,6 +131,7 @@ fn enumerate(
     path: &ExprPath,
     allowed_kinds: KindSet,
     entries: &mut Vec<PathEntry>,
+    catalog: &operators::Catalog,
 ) {
     entries.push(PathEntry {
         path: path.clone(),
@@ -131,14 +142,15 @@ fn enumerate(
         Expr::UnaryCall {
             op, arg, kwargs, ..
         } => {
-            let allowed = positional_kinds(op, 0, arg);
+            let allowed = positional_kinds(op, 0, arg, catalog);
             enumerate(
                 arg,
                 &extended(path, PathSegment::UnaryArg),
                 allowed,
                 entries,
+                catalog,
             );
-            enumerate_keywords(kwargs, path, entries);
+            enumerate_keywords(kwargs, path, entries, catalog);
         }
         Expr::BinaryCall {
             op,
@@ -150,16 +162,18 @@ fn enumerate(
             enumerate(
                 left,
                 &extended(path, PathSegment::BinaryLeft),
-                positional_kinds(op, 0, left),
+                positional_kinds(op, 0, left, catalog),
                 entries,
+                catalog,
             );
             enumerate(
                 right,
                 &extended(path, PathSegment::BinaryRight),
-                positional_kinds(op, 1, right),
+                positional_kinds(op, 1, right, catalog),
                 entries,
+                catalog,
             );
-            enumerate_keywords(kwargs, path, entries);
+            enumerate_keywords(kwargs, path, entries, catalog);
         }
         Expr::VariadicCall {
             op, args, kwargs, ..
@@ -168,11 +182,12 @@ fn enumerate(
                 enumerate(
                     arg,
                     &extended(path, PathSegment::VariadicArg { index }),
-                    positional_kinds(op, index, arg),
+                    positional_kinds(op, index, arg, catalog),
                     entries,
+                    catalog,
                 );
             }
-            enumerate_keywords(kwargs, path, entries);
+            enumerate_keywords(kwargs, path, entries, catalog);
         }
         Expr::Field { .. } | Expr::Scalar { .. } | Expr::Group { .. } | Expr::Bool { .. } => {}
     }
@@ -182,6 +197,7 @@ fn enumerate_keywords(
     kwargs: &std::collections::BTreeMap<String, Expr>,
     path: &ExprPath,
     entries: &mut Vec<PathEntry>,
+    catalog: &operators::Catalog,
 ) {
     for (name, value) in kwargs {
         enumerate(
@@ -189,12 +205,18 @@ fn enumerate_keywords(
             &extended(path, PathSegment::Keyword { name: name.clone() }),
             KindSet::singleton(ExprKind::Scalar),
             entries,
+            catalog,
         );
     }
 }
 
-fn positional_kinds(op: &str, index: usize, actual: &Expr) -> KindSet {
-    let Some(spec) = operators::lookup(op) else {
+fn positional_kinds(
+    op: &str,
+    index: usize,
+    actual: &Expr,
+    catalog: &operators::Catalog,
+) -> KindSet {
+    let Some(spec) = catalog.lookup(op) else {
         return KindSet::singleton(actual.kind());
     };
     let input = match spec.arity {
@@ -240,7 +262,17 @@ pub fn subtree_at<'a>(expression: &'a Expr, path: &ExprPath) -> Option<&'a Expr>
 /// Return all kinds accepted by a path in the current typed tree.
 #[must_use]
 pub fn allowed_kinds(expression: &Expr, path: &ExprPath) -> Option<KindSet> {
-    enumerate_paths(expression)
+    allowed_kinds_with_catalog(expression, path, operators::builtin_catalog())
+}
+
+/// Return accepted kinds using explicit catalog signatures, including custom operators.
+#[must_use]
+pub fn allowed_kinds_with_catalog(
+    expression: &Expr,
+    path: &ExprPath,
+    catalog: &operators::Catalog,
+) -> Option<KindSet> {
+    enumerate_paths_with_catalog(expression, catalog)
         .into_iter()
         .find(|entry| entry.path == *path)
         .map(|entry| entry.allowed_kinds)
@@ -255,8 +287,21 @@ pub fn replace_subtree(
     path: &ExprPath,
     replacement: Expr,
 ) -> Result<Expr, PathError> {
-    let allowed =
-        allowed_kinds(expression, path).ok_or_else(|| PathError::Missing(path.clone()))?;
+    replace_subtree_with_catalog(expression, path, replacement, operators::builtin_catalog())
+}
+
+/// Replace one subtree and validate every containing operator against an explicit catalog.
+///
+/// # Errors
+/// Returns an error for a missing path, incompatible kind, or invalid operator context.
+pub fn replace_subtree_with_catalog(
+    expression: &Expr,
+    path: &ExprPath,
+    replacement: Expr,
+    catalog: &operators::Catalog,
+) -> Result<Expr, PathError> {
+    let allowed = allowed_kinds_with_catalog(expression, path, catalog)
+        .ok_or_else(|| PathError::Missing(path.clone()))?;
     if !allowed.contains(replacement.kind()) {
         return Err(PathError::WrongKind {
             path: path.clone(),
@@ -266,35 +311,41 @@ pub fn replace_subtree(
     }
     let candidate = replace_at(expression, &path.segments, replacement)
         .ok_or_else(|| PathError::Missing(path.clone()))?;
-    validate_structure(&candidate).map_err(|message| PathError::InvalidContext {
+    validate_structure(&candidate, catalog).map_err(|message| PathError::InvalidContext {
         path: path.clone(),
         message,
     })?;
     Ok(candidate)
 }
 
-fn validate_structure(expression: &Expr) -> Result<(), String> {
+fn validate_structure(expression: &Expr, catalog: &operators::Catalog) -> Result<(), String> {
     for child in expression.children() {
-        validate_structure(child)?;
+        validate_structure(child, catalog)?;
     }
     let rebuilt = match expression {
         Expr::UnaryCall {
             op, arg, kwargs, ..
-        } => operators::build_call(op, vec![arg.as_ref().clone()], kwargs.clone())?,
+        } => operators::build_call_with_catalog(
+            catalog,
+            op,
+            vec![arg.as_ref().clone()],
+            kwargs.clone(),
+        )?,
         Expr::BinaryCall {
             op,
             left,
             right,
             kwargs,
             ..
-        } => operators::build_call(
+        } => operators::build_call_with_catalog(
+            catalog,
             op,
             vec![left.as_ref().clone(), right.as_ref().clone()],
             kwargs.clone(),
         )?,
         Expr::VariadicCall {
             op, args, kwargs, ..
-        } => operators::build_call(op, args.clone(), kwargs.clone())?,
+        } => operators::build_call_with_catalog(catalog, op, args.clone(), kwargs.clone())?,
         Expr::Field { .. } | Expr::Scalar { .. } | Expr::Group { .. } | Expr::Bool { .. } => {
             return Ok(());
         }
@@ -347,6 +398,116 @@ fn replace_at(expression: &Expr, segments: &[PathSegment], replacement: Expr) ->
 mod tests {
     use super::*;
     use crate::{canonical, parse_expression};
+
+    #[test]
+    fn custom_slots_use_catalog_kinds_and_preserve_operator_constraints() {
+        let mut catalog = operators::builtin_catalog().clone();
+        let mut custom = catalog.lookup("multiply").unwrap().clone();
+        custom.name = "custom_product".into();
+        catalog.operators.push(custom);
+        catalog.validate().unwrap();
+        let expression =
+            crate::parse_expression_with_catalog("custom_product(close, open)", &catalog).unwrap();
+        let path = ExprPath {
+            segments: vec![PathSegment::VariadicArg { index: 0 }],
+        };
+        assert_eq!(
+            allowed_kinds_with_catalog(&expression, &path, &catalog),
+            Some(KindSet::SIGNAL_OR_SCALAR)
+        );
+        let child =
+            replace_subtree_with_catalog(&expression, &path, Expr::Scalar { value: 2.0 }, &catalog)
+                .unwrap();
+        assert_eq!(canonical(&child), "custom_product(2, open)");
+        let second = ExprPath {
+            segments: vec![PathSegment::VariadicArg { index: 1 }],
+        };
+        // Catalog-aware editing must not bypass the signal-presence constraint.
+        assert!(matches!(
+            replace_subtree_with_catalog(&child, &second, Expr::Scalar { value: 3.0 }, &catalog),
+            Err(PathError::InvalidContext { .. })
+        ));
+        assert!(
+            replace_subtree(
+                &expression,
+                &path,
+                Expr::Field {
+                    name: "high".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_catalog_overrides_embedded_signature_and_enforces_window_domain() {
+        let mut catalog = operators::builtin_catalog().clone();
+        let mean = catalog
+            .operators
+            .iter_mut()
+            .find(|op| op.name == "ts_mean")
+            .unwrap();
+        mean.inputs[0].kinds.push(ExprKind::Scalar);
+        mean.inputs[1].domain = operators::ValueDomain::WindowSet {
+            values: vec![5, 20],
+        };
+        catalog.validate().unwrap();
+        let expression =
+            crate::parse_expression_with_catalog("ts_mean(close, 20)", &catalog).unwrap();
+        let left = ExprPath {
+            segments: vec![PathSegment::BinaryLeft],
+        };
+        let right = ExprPath {
+            segments: vec![PathSegment::BinaryRight],
+        };
+        assert_eq!(
+            allowed_kinds_with_catalog(&expression, &left, &catalog),
+            Some(KindSet::SIGNAL_OR_SCALAR)
+        );
+        assert!(
+            replace_subtree_with_catalog(&expression, &left, Expr::Scalar { value: 2.0 }, &catalog)
+                .is_ok()
+        );
+        assert!(
+            replace_subtree_with_catalog(
+                &expression,
+                &right,
+                Expr::Scalar { value: 6.0 },
+                &catalog
+            )
+            .is_err()
+        );
+        assert!(
+            replace_subtree_with_catalog(
+                &expression,
+                &right,
+                Expr::Scalar { value: 5.0 },
+                &catalog
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn builtin_tree_wrappers_match_explicit_catalog() {
+        let expression = parse_expression("winsorize(ts_mean(close, 20), std=2)").unwrap();
+        let catalog = operators::builtin_catalog();
+        assert_eq!(
+            enumerate_paths(&expression),
+            enumerate_paths_with_catalog(&expression, catalog)
+        );
+        for entry in enumerate_paths(&expression) {
+            let replacement = subtree_at(&expression, &entry.path).unwrap().clone();
+            assert_eq!(
+                allowed_kinds(&expression, &entry.path),
+                allowed_kinds_with_catalog(&expression, &entry.path, catalog)
+            );
+            assert_eq!(
+                replace_subtree(&expression, &entry.path, replacement.clone()),
+                replace_subtree_with_catalog(&expression, &entry.path, replacement, catalog)
+            );
+        }
+    }
 
     #[test]
     fn enumerates_arguments_keywords_and_allowed_kinds() {

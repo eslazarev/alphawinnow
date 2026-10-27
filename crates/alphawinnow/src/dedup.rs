@@ -183,7 +183,7 @@ mod tests {
     fn negative_direction_remains_a_separate_accepted_family() {
         let result = deduplicate(vec![record("close"), record("multiply(close, -2)")]).unwrap();
         assert_eq!(result.accepted.len(), 2);
-        assert!(result.duplicates.is_empty());
-        assert!(result.rejected.is_empty());
+        assert_eq!(result.duplicates, [] as [DuplicateRecord; 0]);
+        assert_eq!(result.rejected, [] as [RejectedRecord; 0]);
     }
 }

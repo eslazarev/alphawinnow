@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "name": "brain-guide-toy-target-not-a-platform-contract",
+  "allowed_fields": ["close", "volume", "returns"],
+  "allowed_operators": ["rank", "ts_mean", "ts_delta", "subtract", "multiply"],
+  "unary_scalar_lowerings": {"negate": {"replacement": "multiply", "scalar": -1.0}}
+}

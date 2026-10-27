@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "purpose": "documentation-only caller-owned context example; not a BRAIN API payload",
+  "market_evidence": false,
+  "data_identity": "synthetic-no-market-data",
+  "evaluation_period": null,
+  "illustrative_external_settings": {
+    "region": "USA", "universe": "TOP3000", "delay": 1,
+    "neutralization": "INDUSTRY", "decay": 0
+  },
+  "objective": "negative min(1 + count of opening parentheses, 20) / 20",
+  "objective_version": "guide-toy-call-count-v1-no-market-data",
+  "pool_context": "guide-fixed-toy-objective-v1",
+  "external_requests_allowed": false,
+  "submission_allowed": false
+}
