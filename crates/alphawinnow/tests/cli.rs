@@ -6,6 +6,7 @@
 
 use std::{fs, path::Path, process::Command};
 
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn command() -> Command {
@@ -938,6 +939,221 @@ fn audit_feedback_reports_leave_one_out_coverage() {
     assert_eq!(payload["records"], 6);
     assert!(payload["coverage"].as_f64().unwrap() > 0.0);
     assert_eq!(payload["feedback_checksum"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn heldout_feedback_cli_rejects_overlap_and_emits_separate_provenance() {
+    let directory = tempdir().unwrap();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/public-feedback-v1.json");
+    let training = directory.path().join("training.json");
+    let evaluation = directory.path().join("evaluation.json");
+    let data: serde_json::Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+    let mut train = data.clone();
+    let mut eval = data.clone();
+    train["records"] = serde_json::Value::Array(data["records"].as_array().unwrap()[..3].to_vec());
+    eval["records"] = serde_json::Value::Array(data["records"].as_array().unwrap()[3..].to_vec());
+    eval["dataset_id"] = "synthetic-evaluation".into();
+    fs::write(&training, serde_json::to_vec(&train).unwrap()).unwrap();
+    fs::write(&evaluation, serde_json::to_vec(&eval).unwrap()).unwrap();
+    let output = command()
+        .args([
+            "audit-feedback",
+            "--feedback",
+            training.to_str().unwrap(),
+            "--evaluation-feedback",
+            evaluation.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["training_records"], 3);
+    assert_eq!(report["metrics"]["records"], 3);
+    assert_eq!(report["predictions"].as_array().unwrap().len(), 3);
+    assert_eq!(report["metrics"]["dataset_id"], "synthetic-evaluation");
+    let overlap = command()
+        .args([
+            "audit-feedback",
+            "--feedback",
+            training.to_str().unwrap(),
+            "--evaluation-feedback",
+            training.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!overlap.status.success());
+    assert!(String::from_utf8_lossy(&overlap.stderr).contains("overlap"));
+}
+
+#[test]
+fn screening_cli_preserves_every_rejection_and_protects_input_files() {
+    let directory = tempdir().unwrap();
+    let input = directory.path().join("candidates.jsonl");
+    let feedback = directory.path().join("feedback.json");
+    let output = directory.path().join("screen.json");
+    fs::write(&input, candidate_line("close") + "\n").unwrap();
+    fs::write(
+        &feedback,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1, "dataset_id": "synthetic-screen", "context_checksum": "fixture",
+            "outcome_label": "synthetic utility", "feature_scales": {"nodes": 10.0},
+            "records": [{"record_id": "negative", "features": {"nodes": 1.0},
+                         "outcome": -1.0, "confidence": 1.0}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let run = |target: &Path, format: &str| {
+        command()
+            .args([
+                "screen-feedback",
+                "--format",
+                format,
+                "--input",
+                input.to_str().unwrap(),
+                "--feedback",
+                feedback.to_str().unwrap(),
+                "--output",
+                target.to_str().unwrap(),
+                "--minimum-conservative-outcome",
+                "0",
+                "--neighbors",
+                "1",
+                "--minimum-neighbors",
+                "1",
+            ])
+            .output()
+            .unwrap()
+    };
+    let result = run(&output, "json");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(report["eligible_records"], 0);
+    assert_eq!(report["rejected_records"], 1);
+    assert_eq!(report["records"][0]["decision"], "below_threshold");
+    assert_eq!(report["schema"], 2);
+    let (_, input_checksum) = alphawinnow::read_candidates_with_checksum(&input).unwrap();
+    assert_eq!(report["input_file_checksum"], input_checksum);
+    let records_json = serde_json::to_vec(&alphawinnow::read_candidates(&input).unwrap()).unwrap();
+    assert_eq!(
+        report["candidate_records_checksum"],
+        format!("{:x}", Sha256::digest(&records_json))
+    );
+    assert_eq!(
+        report["candidate_records_checksum"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(
+        report["records"][0]["guided"]["candidate"]["expression"],
+        "close"
+    );
+    let original = fs::read(&input).unwrap();
+    let jsonl = directory.path().join("screen.jsonl");
+    let result = run(&jsonl, "jsonl");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let content = fs::read_to_string(&jsonl).unwrap();
+    assert_screening_jsonl_parity(&content, &report);
+    let summary: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        summary["content_checksum"],
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    );
+    fs::write(&input, format!("\r\n{}\r\n", candidate_line("close"))).unwrap();
+    assert!(run(&output, "json").status.success());
+    let padded: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(
+        padded["candidate_records_checksum"],
+        report["candidate_records_checksum"]
+    );
+    assert_ne!(padded["input_file_checksum"], report["input_file_checksum"]);
+    fs::write(&input, &original).unwrap();
+    assert!(!run(&input, "json").status.success());
+    assert_eq!(fs::read(&input).unwrap(), original);
+    let original_feedback = fs::read(&feedback).unwrap();
+    assert!(!run(&feedback, "jsonl").status.success());
+    assert_eq!(fs::read(&feedback).unwrap(), original_feedback);
+    fs::write(&input, "").unwrap();
+    assert!(run(&jsonl, "jsonl").status.success());
+    let empty = fs::read_to_string(&jsonl).unwrap();
+    assert_eq!(empty.lines().count(), 1);
+    let header: serde_json::Value = serde_json::from_str(empty.trim()).unwrap();
+    assert_eq!(header["eligible_records"], 0);
+    assert_eq!(header["rejected_records"], 0);
+}
+
+fn assert_screening_jsonl_parity(content: &str, report: &serde_json::Value) {
+    let rows: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["type"], "metadata");
+    let mut metadata = rows[0].clone();
+    metadata.as_object_mut().unwrap().remove("type");
+    let mut expected = report.clone();
+    expected.as_object_mut().unwrap().remove("records");
+    assert_eq!(metadata, expected);
+    assert_eq!(rows[1]["type"], "candidate");
+    assert_eq!(rows[1]["record"], report["records"][0]);
+}
+
+#[test]
+fn feedback_read_and_parse_errors_identify_the_path() {
+    let directory = tempdir().unwrap();
+    let input = directory.path().join("input.jsonl");
+    let bad = directory.path().join("missing-or-invalid-feedback.json");
+    let output = directory.path().join("output.json");
+    let training =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/public-feedback-v1.json");
+    fs::write(&input, candidate_line("close")).unwrap();
+    for invalid_json in [false, true] {
+        if invalid_json {
+            fs::write(&bad, "not json").unwrap();
+        }
+        for action in ["audit-feedback", "screen-feedback", "prioritize"] {
+            let mut command = command();
+            command.args([action, "--feedback", bad.to_str().unwrap()]);
+            if action != "audit-feedback" {
+                command.args([
+                    "--input",
+                    input.to_str().unwrap(),
+                    "--output",
+                    output.to_str().unwrap(),
+                ]);
+            }
+            if action == "screen-feedback" {
+                command.args(["--minimum-conservative-outcome", "0"]);
+            }
+            let result = command.output().unwrap();
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains(bad.to_str().unwrap()));
+        }
+        let result = command()
+            .args([
+                "audit-feedback",
+                "--feedback",
+                training.to_str().unwrap(),
+                "--evaluation-feedback",
+                bad.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(bad.to_str().unwrap()));
+    }
 }
 
 #[cfg(feature = "numeric-evidence")]

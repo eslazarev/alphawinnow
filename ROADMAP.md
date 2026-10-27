@@ -8,7 +8,10 @@ This roadmap describes intended product direction, not a promise of delivery
 dates. Priorities may change when benchmarks, correctness tests, or community
 feedback show that a different order is more useful.
 
-## Available now
+## Implemented in this checkout
+
+The 0.3.0 release is prepared, not yet published. See its release notes for
+availability and migration; this list describes the source tree.
 
 - A typed quantitative-expression AST, parser, formatter, and validator.
 - A configurable catalog for fields, groups, operators, scalar domains, and
@@ -29,6 +32,10 @@ feedback show that a different order is more useful.
 - A library-only ask/tell search session with explicit evaluator context,
   finite-outcome validation, bounded proposals, and checkpoint restoration.
 - Explicit same-cohort score/uniform retention policies for controlled studies.
+- Warm starts from caller-measured parents and historical semantic exclusions.
+- Screened ask/tell updates with separate imported/measured/omitted counters.
+- Separate held-out feedback audits and explicit threshold-based abstention.
+- Optional field-set coverage and exact unit-scaling reduction helpers.
 - Target-dialect compilation and fail-closed linting.
 
 ## Next
@@ -104,8 +111,8 @@ comparison.
 
 ### Public API stabilization
 
-Continue stabilizing the published pre-1.0 Rust API. Release 0.2.0 documents
-breaking API/artifact changes and includes a synthetic ask/tell example;
+Continue stabilizing the published pre-1.0 Rust API. Release 0.3.0 documents
+new error variants and opt-in measured checkpoint schema 2;
 long-term cross-version checkpoint compatibility is not yet promised.
 
 ## Good first contributions

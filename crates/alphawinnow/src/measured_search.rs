@@ -12,6 +12,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::Arc,
 };
 
 use rand::{Rng, SeedableRng, seq::SliceRandom};
@@ -28,6 +29,79 @@ use crate::{
 
 /// Schema for direct measured-search checkpoints.
 pub const MEASURED_SEARCH_SCHEMA: u32 = 1;
+
+/// Checkpoints with measured bootstrap parents, exclusions or screened batches.
+pub const BOOTSTRAPPED_SEARCH_SCHEMA: u32 = 2;
+
+/// Envelope for an opt-in checkpoint referring to separately persisted history.
+pub const REFERENCED_SEARCH_SCHEMA: u32 = 3;
+
+/// Immutable, validated exclusion archive, shared cheaply between restored sessions.
+/// Persist `to_json()` once; its checksum hashes the canonical sorted JSON array.
+/// The digest detects accidental archive mismatch, not malicious tampering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedHistory {
+    entries: Arc<BTreeSet<String>>,
+    checksum: String,
+}
+
+impl ExcludedHistory {
+    /// Validate up to 100,000 lowercase SHA-256 semantic identities.
+    ///
+    /// # Errors
+    /// Rejects invalid fingerprints or an excessive archive.
+    pub fn new(entries: BTreeSet<String>) -> Result<Self, MeasuredSearchError> {
+        ensure(
+            entries.len() <= 100_000
+                && entries.iter().all(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }),
+            "invalid historical semantic fingerprints",
+        )?;
+        let checksum = crate::canonical::digest(&serde_json::to_string(&entries)?);
+        Ok(Self {
+            entries: Arc::new(entries),
+            checksum,
+        })
+    }
+
+    /// Read a bounded canonicalizable JSON array; validate/hash it once on load.
+    ///
+    /// # Errors
+    /// Rejects invalid JSON, fingerprints, or input over 8 MiB.
+    pub fn from_json(content: &str) -> Result<Self, MeasuredSearchError> {
+        ensure(content.len() <= 8 * 1024 * 1024, "history exceeds 8 MiB")?;
+        Ok(serde_json::from_str(content)?)
+    }
+
+    /// Serialize the standalone history array for caller-owned durable storage.
+    ///
+    /// # Errors
+    /// Returns a JSON serialization error.
+    pub fn to_json(&self) -> Result<String, MeasuredSearchError> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    #[must_use]
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+}
+
+impl Serialize for ExcludedHistory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.entries.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExcludedHistory {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = BTreeSet::<String>::deserialize(deserializer)?;
+        Self::new(entries).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Data-independent policy used for fresh exploration proposals.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +152,10 @@ pub enum MeasuredParentSelection {
 }
 
 impl MeasuredParentSelection {
+    fn supports_screened_snapshot(self) -> bool {
+        matches!(self, Self::Score | Self::ScoreDiverseV1)
+    }
+
     fn is_latest_batch(self) -> bool {
         matches!(self, Self::LatestBatchScoreV1 | Self::LatestBatchUniformV1)
     }
@@ -149,7 +227,15 @@ fn diverse_parents(
 pub struct MeasuredSearchConfig {
     pub seed: u64,
     pub limits: Limits,
-    /// Total emitted, semantically unique proposals (at most 100,000).
+    /// Hard ceiling on emitted, semantically unique NEW PROPOSALS (1..=100,000),
+    /// NOT on measurements or external evaluator calls. The historical name is
+    /// retained for configuration/checkpoint compatibility.
+    ///
+    /// Every proposal emitted by `ask` spends this budget, including proposals
+    /// omitted by `tell_screened`. Imported seeds and incumbent rescoring do not.
+    /// For example, 32 proposals in batches of 8, measuring 2 per batch, yields
+    /// 8 new measurements and 24 screened-out proposals, then exhausts the budget.
+    /// Keep a separate external-call budget in the caller.
     pub max_evaluations: usize,
     /// Total attempted transforms, including invalid and duplicate proposals.
     pub max_attempts: u64,
@@ -179,11 +265,11 @@ impl MeasuredSearchConfig {
             .map_err(MeasuredSearchError::Invalid)?;
         ensure(
             self.max_evaluations > 0 && self.max_evaluations <= 100_000,
-            "evaluation budget must be in 1..=100000",
+            "new-proposal budget (max_evaluations) must be in 1..=100000",
         )?;
         ensure(
             self.max_attempts >= self.max_evaluations as u64 && self.max_attempts <= 10_000_000,
-            "attempt budget must cover evaluations and be <= 10000000",
+            "attempt budget must cover new proposals and be <= 10000000",
         )?;
         ensure(
             (1..=256).contains(&self.batch_size) && (1..=256).contains(&self.parent_capacity),
@@ -216,6 +302,22 @@ pub struct MeasuredOutcome {
     pub outcome: f64,
 }
 
+/// A caller-audited measurement in the session's exact evaluator context.
+/// These records initialize parents; they do not consume new-proposal budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredSeed {
+    pub record_id: String,
+    pub expression: String,
+    pub outcome: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Bootstrap {
+    seeds: Vec<MeasuredSeed>,
+    pool_context: String,
+    excluded: ExcludedHistory,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Parent {
     proposal: MeasuredProposal,
@@ -234,15 +336,137 @@ struct State {
     seen: BTreeSet<String>,
     parents: Vec<Parent>,
     pending: Vec<MeasuredProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap: Option<Bootstrap>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    screened_out: BTreeSet<usize>,
 }
 
-fn validate_latest_cohort(state: &State) -> Result<(), MeasuredSearchError> {
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferencedCheckpoint {
+    schema: u32,
+    excluded_sha256: String,
+    state: State,
+}
+
+struct ValidatedSeeds {
+    seeds: Vec<MeasuredSeed>,
+    parents: Vec<Parent>,
+    identities: BTreeSet<String>,
+}
+
+fn validate_seeds(
+    config: &MeasuredSearchConfig,
+    catalog: &Catalog,
+    pool_context: &str,
+    seeds: &[MeasuredSeed],
+) -> Result<ValidatedSeeds, MeasuredSearchError> {
+    ensure(
+        !pool_context.trim().is_empty() && pool_context.len() <= 4096,
+        "pool context must be nonempty and bounded",
+    )?;
+    ensure(
+        config.parent_selection.supports_screened_snapshot(),
+        "bootstrap requires a snapshot score policy",
+    )?;
+    ensure(
+        !seeds.is_empty() && seeds.len() <= config.parent_capacity,
+        "bootstrap seeds must fit parent capacity",
+    )?;
+    let mut records = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for seed in seeds {
+        ensure(
+            !seed.record_id.trim().is_empty()
+                && seed.record_id.len() <= 4096
+                && records.insert(&seed.record_id)
+                && seed.outcome.is_finite()
+                && seed.expression.len() <= 65_536,
+            "invalid or duplicate measured seed record",
+        )?;
+        let expr = parse_expression_with_catalog(&seed.expression, catalog)
+            .map_err(|e| MeasuredSearchError::Invalid(e.to_string()))?;
+        ensure(
+            expr.kind() == ExprKind::Signal
+                && validate_transformed_with_catalog(&expr, &config.limits, catalog).is_ok()
+                && analyze_expression(&expr).rejection_reason.is_none(),
+            "invalid measured seed expression",
+        )?;
+        let identity = semantic_fingerprint(&expr);
+        ensure(
+            identities.insert(identity.clone()),
+            "duplicate semantic seed",
+        )?;
+        normalized.push((
+            MeasuredSeed {
+                record_id: seed.record_id.clone(),
+                expression: canonical(&expr),
+                outcome: seed.outcome,
+            },
+            identity,
+        ));
+    }
+    normalized.sort_by(|a, b| a.0.record_id.cmp(&b.0.record_id));
+    let mut parents: Vec<_> = normalized
+        .iter()
+        .enumerate()
+        .map(|(i, (seed, identity))| Parent {
+            proposal: MeasuredProposal {
+                ordinal: i + 1,
+                expression: seed.expression.clone(),
+                semantic_fingerprint: identity.clone(),
+                provenance: Provenance {
+                    kind: crate::TransformKind::Initial,
+                    operation: format!("measured_bootstrap:{}", seed.record_id),
+                    parent_fingerprints: Vec::new(),
+                    requested_operation: None,
+                    affected_path: None,
+                    old_subtree_fingerprint: None,
+                    new_subtree_fingerprint: None,
+                    retry_count: 0,
+                },
+            },
+            outcome: seed.outcome,
+        })
+        .collect();
+    score_order(&mut parents);
+    Ok(ValidatedSeeds {
+        seeds: normalized.into_iter().map(|(s, _)| s).collect(),
+        parents,
+        identities,
+    })
+}
+
+impl State {
+    fn imported(&self) -> usize {
+        self.bootstrap.as_ref().map_or(0, |b| b.seeds.len())
+    }
+
+    fn excluded(&self, identity: &str) -> bool {
+        self.bootstrap
+            .as_ref()
+            .is_some_and(|b| b.excluded.entries.contains(identity))
+    }
+}
+
+fn validate_parent_cohort(state: &State) -> Result<(), MeasuredSearchError> {
     if state.config.parent_selection.is_latest_batch() && state.measured > 0 {
         let start = (state.measured - 1) / state.config.batch_size * state.config.batch_size;
         ensure(
             state.parents.len() == state.config.parent_capacity.min(state.measured - start)
                 && state.parents.iter().all(|p| p.proposal.ordinal > start),
             "latest-batch checkpoint contains stale or missing parents",
+        )?;
+    } else {
+        ensure(
+            state.parents.len()
+                == state
+                    .config
+                    .parent_capacity
+                    .min(state.measured - state.screened_out.len()),
+            "snapshot checkpoint contains missing parents",
         )?;
     }
     Ok(())
@@ -298,13 +522,60 @@ impl MeasuredSearchSession {
             seen: BTreeSet::new(),
             parents: Vec::new(),
             pending: Vec::new(),
+            bootstrap: None,
+            screened_out: BTreeSet::new(),
         };
         Ok(Self { catalog, state })
     }
 
+    /// Start from measured parents and an all-history semantic exclusion set.
+    ///
+    /// The caller must audit labels, catalog/operator compatibility and settings.
+    /// Context strings assert identity, not proof of measurement. Use one common
+    /// objective/reference pool; do not mix stale marginal scores across pools.
+    /// Select at most `parent_capacity` seeds externally. Both positive and
+    /// negative historical attempts should be excluded using fingerprints from
+    /// this library, not another engine's hashes. Exclusions are not labels.
+    ///
+    /// Only snapshot score policies are supported: every subsequent `tell`
+    /// re-scores incumbents with the completed batch, permitting new winners to
+    /// replace seeds. Reuse cached measurements only when their context is valid.
+    /// No network requests or external evaluations are performed here.
+    ///
+    /// # Errors
+    /// Rejects context mismatch, invalid/duplicate seeds, incompatible policies,
+    /// non-finite outcomes and malformed or excessive historical fingerprints.
+    pub fn from_measured_parents(
+        config: MeasuredSearchConfig,
+        catalog: Catalog,
+        evaluator_context: &str,
+        pool_context: &str,
+        seeds: &[MeasuredSeed],
+        excluded: &BTreeSet<String>,
+    ) -> Result<Self, MeasuredSearchError> {
+        let mut session = Self::new(config, catalog)?;
+        ensure(
+            evaluator_context == session.state.config.evaluator_context,
+            "evaluator context differs",
+        )?;
+        let initial = validate_seeds(&session.state.config, &session.catalog, pool_context, seeds)?;
+        session.state.seen = initial.identities;
+        session.state.parents = initial.parents;
+        session.state.schema = BOOTSTRAPPED_SEARCH_SCHEMA;
+        session.state.emitted = seeds.len();
+        session.state.measured = seeds.len();
+        session.state.pool_context = Some(pool_context.to_owned());
+        session.state.bootstrap = Some(Bootstrap {
+            seeds: initial.seeds,
+            pool_context: pool_context.to_owned(),
+            excluded: ExcludedHistory::new(excluded.clone())?,
+        });
+        Ok(session)
+    }
+
     /// Return the current batch, or propose a new one from measured parents.
     /// Repeated calls before `tell` return exactly the same pending batch.
-    /// An empty batch means the evaluation or transform budget is exhausted.
+    /// An empty batch means the new-proposal or transform budget is exhausted.
     /// Each transform is bounded by the configured expression limits.
     ///
     /// # Errors
@@ -316,7 +587,7 @@ impl MeasuredSearchSession {
         let config = &self.state.config;
         let target = config
             .batch_size
-            .min(config.max_evaluations - self.state.emitted);
+            .min(config.max_evaluations - (self.state.emitted - self.state.imported()));
         let parents = self
             .state
             .parents
@@ -375,7 +646,7 @@ impl MeasuredSearchSession {
                 continue;
             }
             let identity = semantic_fingerprint(&expression);
-            if !self.state.seen.insert(identity.clone()) {
+            if self.state.excluded(&identity) || !self.state.seen.insert(identity.clone()) {
                 continue;
             }
             self.state.emitted += 1;
@@ -420,6 +691,45 @@ impl MeasuredSearchSession {
         pool_context: &str,
         outcomes: &[MeasuredOutcome],
     ) -> Result<(), MeasuredSearchError> {
+        self.apply_snapshot(evaluator_context, pool_context, outcomes, false)
+    }
+
+    /// Resolve a screened pool with actual measurements only for its selected subset.
+    ///
+    /// Supply every incumbent and at least one pending proposal. Pending proposals
+    /// absent from `outcomes` are permanently screened out, not assigned invented
+    /// negative labels. They remain deduplicated and consume proposal/attempt
+    /// budget, but not `measured()`. Use only after the selected batch is complete;
+    /// missing or uncertain external responses are NOT screening decisions.
+    /// Selection and surrogate fitting belong to the caller, not this method.
+    ///
+    /// # Errors
+    /// Rejects non-snapshot policies, missing incumbent scores, empty selections,
+    /// wrong contexts, unexpected identities, duplicate or non-finite outcomes.
+    /// Errors leave the session unchanged.
+    pub fn tell_screened(
+        &mut self,
+        evaluator_context: &str,
+        pool_context: &str,
+        outcomes: &[MeasuredOutcome],
+    ) -> Result<(), MeasuredSearchError> {
+        ensure(
+            self.state
+                .config
+                .parent_selection
+                .supports_screened_snapshot(),
+            "screened feedback requires a snapshot score policy",
+        )?;
+        self.apply_snapshot(evaluator_context, pool_context, outcomes, true)
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        evaluator_context: &str,
+        pool_context: &str,
+        outcomes: &[MeasuredOutcome],
+        screened: bool,
+    ) -> Result<(), MeasuredSearchError> {
         ensure(
             evaluator_context == self.state.config.evaluator_context,
             "evaluator context differs",
@@ -443,9 +753,33 @@ impl MeasuredSearchSession {
                 "duplicate outcome",
             )?;
         }
-        ensure(scores.len() == requests.len(), "incomplete score snapshot")?;
+        let omitted: BTreeSet<_> = if screened {
+            ensure(
+                scores.len() > self.state.parents.len()
+                    && scores.len() <= requests.len()
+                    && self
+                        .state
+                        .parents
+                        .iter()
+                        .all(|p| scores.contains_key(&p.proposal.semantic_fingerprint))
+                    && scores
+                        .keys()
+                        .all(|id| requests.iter().any(|p| &p.semantic_fingerprint == *id)),
+                "screened snapshot needs all incumbents and measured pending proposals",
+            )?;
+            self.state
+                .pending
+                .iter()
+                .filter(|p| !scores.contains_key(&p.semantic_fingerprint))
+                .map(|p| p.ordinal)
+                .collect()
+        } else {
+            ensure(scores.len() == requests.len(), "incomplete score snapshot")?;
+            BTreeSet::new()
+        };
         let mut parents = requests
             .into_iter()
+            .filter(|p| !omitted.contains(&p.ordinal))
             .map(|proposal| {
                 let outcome = scores.get(&proposal.semantic_fingerprint).ok_or_else(|| {
                     MeasuredSearchError::Invalid("missing or unexpected score identity".to_owned())
@@ -486,6 +820,10 @@ impl MeasuredSearchSession {
         }
         parents.truncate(self.state.config.parent_capacity);
         self.state.parents = parents;
+        if !omitted.is_empty() {
+            self.state.schema = BOOTSTRAPPED_SEARCH_SCHEMA;
+            self.state.screened_out.extend(omitted);
+        }
         self.state.measured += self.state.pending.len();
         self.state.pending.clear();
         self.state.pool_context = Some(pool_context.to_owned());
@@ -511,10 +849,84 @@ impl MeasuredSearchSession {
     /// Number of emitted proposals with accepted measurements.
     #[must_use]
     pub fn measured(&self) -> usize {
-        self.state.measured
+        self.state.measured - self.state.imported() - self.state.screened_out.len()
+    }
+
+    /// Proposals screened out without measurement, never treated as negative labels.
+    #[must_use]
+    pub fn screened_out(&self) -> usize {
+        self.state.screened_out.len()
+    }
+
+    /// Number of imported measurements, separate from newly measured proposals.
+    #[must_use]
+    pub fn imported(&self) -> usize {
+        self.state.imported()
+    }
+
+    /// Immutable archive to persist once before using referenced checkpoints.
+    #[must_use]
+    pub fn excluded_history(&self) -> Option<&ExcludedHistory> {
+        self.state.bootstrap.as_ref().map(|b| &b.excluded)
+    }
+
+    /// Serialize a schema-3 envelope without repeating the immutable exclusion set.
+    /// Seeds, live seen identities, parents and pending proposals remain inline.
+    /// Persist `excluded_history().to_json()` separately FIRST, using its checksum
+    /// as the artifact key. This format is opt-in; `checkpoint_json` stays standalone.
+    ///
+    /// # Errors
+    /// Rejects a session without bootstrap history or serialization failure.
+    pub fn checkpoint_with_history_json(&self) -> Result<String, MeasuredSearchError> {
+        let mut state = self.state.clone(); // Exclusion storage is Arc-shared, not copied.
+        let bootstrap = state.bootstrap.as_mut().ok_or_else(|| {
+            MeasuredSearchError::Invalid("referenced checkpoint requires bootstrap".into())
+        })?;
+        let excluded_sha256 = bootstrap.excluded.checksum().to_owned();
+        bootstrap.excluded = ExcludedHistory::new(BTreeSet::new())?;
+        Ok(serde_json::to_string(&ReferencedCheckpoint {
+            schema: REFERENCED_SEARCH_SCHEMA,
+            excluded_sha256,
+            state,
+        })?)
+    }
+
+    /// Restore a referenced checkpoint against a preloaded, checksum-bound archive.
+    /// Loading/validating history once and reusing this value avoids reparsing or
+    /// cloning 100k exclusions on every restore. The original metadata/proposal
+    /// validators still run; the checkpoint cannot supply replacement history.
+    ///
+    /// # Errors
+    /// Rejects missing/mismatched history, embedded history, bad schemas or state.
+    pub fn from_checkpoint_with_history_json(
+        content: &str,
+        config: MeasuredSearchConfig,
+        catalog: Catalog,
+        history: &ExcludedHistory,
+    ) -> Result<Self, MeasuredSearchError> {
+        ensure(
+            content.len() <= 64 * 1024 * 1024,
+            "checkpoint exceeds 64 MiB",
+        )?;
+        let mut referenced: ReferencedCheckpoint = serde_json::from_str(content)?;
+        ensure(
+            referenced.schema == REFERENCED_SEARCH_SCHEMA
+                && referenced.excluded_sha256 == history.checksum(),
+            "referenced history mismatch",
+        )?;
+        let bootstrap = referenced.state.bootstrap.as_mut().ok_or_else(|| {
+            MeasuredSearchError::Invalid("referenced checkpoint requires bootstrap".into())
+        })?;
+        ensure(
+            bootstrap.excluded.entries.is_empty(),
+            "referenced checkpoint embeds history",
+        )?;
+        bootstrap.excluded = history.clone();
+        Self::restore_state(referenced.state, config, catalog)
     }
 
     /// Serialize all bounded state, including pending proposals and RNG indices.
+    /// Finite outcome bits (including signed zero) round-trip through the reader.
     ///
     /// # Errors
     /// Returns a JSON serialization error.
@@ -524,7 +936,7 @@ impl MeasuredSearchSession {
 
     /// Build an embeddable JSON value directly from state, without reparsing
     /// decimal floats through a string intermediary. Preserves outcome bits
-    /// in memory; this does not change the historical checkpoint reader.
+    /// in memory. The string checkpoint reader also preserves finite outcome bits.
     ///
     /// # Errors
     /// Returns a JSON serialization error.
@@ -545,18 +957,67 @@ impl MeasuredSearchSession {
             content.len() <= 64 * 1024 * 1024,
             "checkpoint exceeds 64 MiB",
         )?;
-        let mut session = Self::new(config, catalog)?;
         let state: State = serde_json::from_str(content)?;
+        Self::restore_state(state, config, catalog)
+    }
+
+    fn restore_state(
+        state: State,
+        config: MeasuredSearchConfig,
+        catalog: Catalog,
+    ) -> Result<Self, MeasuredSearchError> {
+        let mut session = Self::new(config, catalog)?;
+        let initial = session.validate_checkpoint_metadata(&state)?;
+        session.validate_checkpoint_proposals(&state, initial.as_ref())?;
+        session.state = state;
+        Ok(session)
+    }
+
+    fn validate_checkpoint_metadata(
+        &self,
+        state: &State,
+    ) -> Result<Option<ValidatedSeeds>, MeasuredSearchError> {
         ensure(
-            state.schema == MEASURED_SEARCH_SCHEMA
-                && state.config == session.state.config
-                && state.catalog_checksum == session.state.catalog_checksum,
+            state.schema
+                == if state.bootstrap.is_some() || !state.screened_out.is_empty() {
+                    BOOTSTRAPPED_SEARCH_SCHEMA
+                } else {
+                    MEASURED_SEARCH_SCHEMA
+                }
+                && state.config == self.state.config
+                && state.catalog_checksum == self.state.catalog_checksum,
             "checkpoint configuration differs",
         )?;
+        let initial = if let Some(bootstrap) = &state.bootstrap {
+            let initial = validate_seeds(
+                &self.state.config,
+                &self.catalog,
+                &bootstrap.pool_context,
+                &bootstrap.seeds,
+            )?;
+            ensure(initial.seeds == bootstrap.seeds, "noncanonical bootstrap")?;
+            Some(initial)
+        } else {
+            None
+        };
+        let imported = state.imported();
         ensure(
-            state.emitted <= state.config.max_evaluations
+            state.emitted >= imported && state.measured >= imported,
+            "invalid imported counters",
+        )?;
+        ensure(
+            state
+                .screened_out
+                .iter()
+                .all(|ordinal| *ordinal > imported && *ordinal <= state.measured)
+                && (state.screened_out.is_empty()
+                    || state.config.parent_selection.supports_screened_snapshot()),
+            "invalid screened-out ordinals or policy",
+        )?;
+        ensure(
+            state.emitted - imported <= state.config.max_evaluations
                 && state.attempted <= state.config.max_attempts
-                && state.attempted >= state.emitted as u64
+                && state.attempted >= (state.emitted - imported) as u64
                 && state.measured <= state.emitted
                 && state.emitted - state.measured == state.pending.len()
                 && state.pending.len() <= state.config.batch_size
@@ -565,6 +1026,27 @@ impl MeasuredSearchSession {
                 && state.seen.len() == state.emitted,
             "invalid checkpoint counters",
         )?;
+        if let Some(initial) = &initial {
+            ensure(
+                initial.identities.is_subset(&state.seen),
+                "missing imported identity",
+            )?;
+            ensure(
+                state
+                    .seen
+                    .iter()
+                    .all(|id| !state.excluded(id) || initial.identities.contains(id)),
+                "historical identity emitted again",
+            )?;
+            if state.measured == imported {
+                ensure(
+                    state.parents == initial.parents
+                        && state.pool_context.as_deref()
+                            == state.bootstrap.as_ref().map(|b| b.pool_context.as_str()),
+                    "altered bootstrap parents",
+                )?;
+            }
+        }
         ensure(
             (state.measured == 0 && state.pool_context.is_none())
                 || (state.measured > 0
@@ -574,6 +1056,15 @@ impl MeasuredSearchSession {
                         .is_some_and(|s| !s.trim().is_empty() && s.len() <= 4096)),
             "invalid checkpoint pool context",
         )?;
+        Ok(initial)
+    }
+
+    fn validate_checkpoint_proposals(
+        &self,
+        state: &State,
+        initial: Option<&ValidatedSeeds>,
+    ) -> Result<(), MeasuredSearchError> {
+        let imported = state.imported();
         let mut identities = BTreeSet::new();
         let mut ordinals = BTreeSet::new();
         for proposal in state
@@ -582,14 +1073,22 @@ impl MeasuredSearchSession {
             .map(|p| &p.proposal)
             .chain(&state.pending)
         {
-            let expression = parse_expression_with_catalog(&proposal.expression, &session.catalog)
+            if let Some(initial) = &initial
+                && proposal.ordinal <= imported
+            {
+                ensure(
+                    initial.parents.iter().any(|p| p.proposal == *proposal),
+                    "altered imported proposal",
+                )?;
+            }
+            let expression = parse_expression_with_catalog(&proposal.expression, &self.catalog)
                 .map_err(|error| MeasuredSearchError::Invalid(error.to_string()))?;
             ensure(
                 expression.kind() == ExprKind::Signal
                     && validate_transformed_with_catalog(
                         &expression,
                         &state.config.limits,
-                        &session.catalog,
+                        &self.catalog,
                     )
                     .is_ok()
                     && analyze_expression(&expression).rejection_reason.is_none()
@@ -599,6 +1098,7 @@ impl MeasuredSearchSession {
                     && identities.insert(proposal.semantic_fingerprint.clone())
                     && proposal.ordinal > 0
                     && proposal.ordinal <= state.emitted
+                    && !state.screened_out.contains(&proposal.ordinal)
                     && ordinals.insert(proposal.ordinal),
                 "invalid checkpoint proposal",
             )?;
@@ -610,7 +1110,7 @@ impl MeasuredSearchSession {
                 .all(|p| p.outcome.is_finite() && p.proposal.ordinal <= state.measured),
             "invalid checkpoint parent",
         )?;
-        validate_latest_cohort(&state)?;
+        validate_parent_cohort(state)?;
         ensure(
             state
                 .pending
@@ -638,8 +1138,7 @@ impl MeasuredSearchSession {
                 }),
             "invalid parent ordering",
         )?;
-        session.state = state;
-        Ok(session)
+        Ok(())
     }
 
     /// Durably replace a checkpoint using the library's atomic writer.

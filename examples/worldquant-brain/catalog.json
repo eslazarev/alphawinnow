@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "name": "brain-guide-synthetic-subset-v1",
+  "scalar_domain": {"min": -2.0, "max": 2.0, "step": 1.0},
+  "fields": [
+    {"name": "close", "kind": "signal", "family": "toy-price", "allowed_roles": ["signal_input"]},
+    {"name": "volume", "kind": "signal", "family": "toy-volume", "allowed_roles": ["signal_input"]},
+    {"name": "returns", "kind": "signal", "family": "toy-return", "allowed_roles": ["signal_input"]}
+  ],
+  "groups": [{"name": "sector", "kind": "group"}],
+  "operators": [
+    {"name": "rank", "arity": {"kind": "unary"}, "inputs": [{"kinds": ["signal"]}], "output": "signal", "generation_weight": 2},
+    {"name": "negate", "arity": {"kind": "unary"}, "inputs": [{"kinds": ["signal"]}], "output": "signal", "generation_weight": 1},
+    {"name": "ts_mean", "arity": {"kind": "binary"}, "inputs": [{"kinds": ["signal"]}, {"kinds": ["scalar"], "domain": {"kind": "window_set", "values": [5, 10, 20, 60]}}], "output": "signal", "generation_weight": 3},
+    {"name": "ts_delta", "arity": {"kind": "binary"}, "inputs": [{"kinds": ["signal"]}, {"kinds": ["scalar"], "domain": {"kind": "window_set", "values": [5, 10, 20, 60]}}], "output": "signal", "generation_weight": 3},
+    {"name": "subtract", "arity": {"kind": "binary"}, "inputs": [{"kinds": ["signal"]}, {"kinds": ["signal"]}], "output": "signal", "generation_weight": 1},
+    {"name": "multiply", "arity": {"kind": "variadic", "min": 2, "max": 8}, "inputs": [{"kinds": ["signal", "scalar"]}], "required_input_kinds": ["signal"], "output": "signal", "commutative": true, "associative": true, "generation_weight": 1}
+  ]
+}

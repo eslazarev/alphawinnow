@@ -11,7 +11,10 @@ use crate::{
     canonical::{canonical, digest, fingerprint, semantic_fingerprint},
     operators::{self, Arity, OperatorSpec, ValueDomain},
     parser::parse_expression_with_catalog,
-    tree::{ExprPath, PathEntry, PathSegment, enumerate_paths, replace_subtree, subtree_at},
+    tree::{
+        ExprPath, PathEntry, PathSegment, enumerate_paths, enumerate_paths_with_catalog,
+        replace_subtree_with_catalog, subtree_at,
+    },
 };
 
 const RETRY_BUDGET: u32 = 16;
@@ -1020,7 +1023,7 @@ pub fn mutate_applicable_with_catalog(
     limits: &Limits,
     catalog: &operators::Catalog,
 ) -> (Expr, Provenance) {
-    let paths = enumerate_paths(parent);
+    let paths = enumerate_paths_with_catalog(parent, catalog);
     let mut candidates = Vec::new();
     for class in MutationClass::ALL {
         if !paths
@@ -1130,7 +1133,9 @@ fn try_mutate_with_rng(
         if canonical(old) == canonical(&replacement) {
             continue;
         }
-        let Ok(candidate) = replace_subtree(parent, &path, replacement.clone()) else {
+        let Ok(candidate) =
+            replace_subtree_with_catalog(parent, &path, replacement.clone(), catalog)
+        else {
             continue;
         };
         if candidate == *parent
@@ -1184,11 +1189,11 @@ pub fn crossover_with_catalog(
     catalog: &operators::Catalog,
 ) -> (Expr, Provenance) {
     let mut rng = seeded(seed, ordinal, 0x94d0_49bb_1331_11eb);
-    let receivers: Vec<_> = enumerate_paths(left)
+    let receivers: Vec<_> = enumerate_paths_with_catalog(left, catalog)
         .into_iter()
         .filter(|entry| !entry.path.segments.is_empty())
         .collect();
-    let donors = enumerate_paths(right);
+    let donors = enumerate_paths_with_catalog(right, catalog);
     let pairs: Vec<_> = receivers
         .iter()
         .flat_map(|receiver| {
@@ -1265,7 +1270,9 @@ fn crossover_pairs(
         if canonical(old) == canonical(replacement) {
             continue;
         }
-        let Ok(candidate) = replace_subtree(left, &receiver.path, replacement.clone()) else {
+        let Ok(candidate) =
+            replace_subtree_with_catalog(left, &receiver.path, replacement.clone(), catalog)
+        else {
             continue;
         };
         if candidate == *left
@@ -1340,7 +1347,7 @@ fn mutation_replacement(
     limits: &Limits,
     catalog: &operators::Catalog,
 ) -> Option<(ExprPath, Expr)> {
-    let entries = enumerate_paths(parent);
+    let entries = enumerate_paths_with_catalog(parent, catalog);
     let eligible: Vec<_> = entries
         .into_iter()
         .filter(|entry| mutation_path_matches(parent, entry, class, catalog))
@@ -1404,9 +1411,9 @@ fn mutation_path_matches(
 }
 
 fn is_window_path(parent: &Expr, path: &ExprPath, catalog: &operators::Catalog) -> bool {
-    if !matches!(path.segments.last(), Some(PathSegment::BinaryRight)) {
+    let Some(segment) = path.segments.last() else {
         return false;
-    }
+    };
     let parent_path = ExprPath {
         segments: path.segments[..path.segments.len() - 1].to_vec(),
     };
@@ -1414,9 +1421,6 @@ fn is_window_path(parent: &Expr, path: &ExprPath, catalog: &operators::Catalog) 
         return false;
     };
     let Some(operator) = owner.operator().and_then(|name| catalog.lookup(name)) else {
-        return false;
-    };
-    let Some(segment) = path.segments.last() else {
         return false;
     };
     let index = match segment {
@@ -1890,6 +1894,91 @@ mod tests {
             "add(group_rank(ts_mean(close, 20), group(\"sector\")), winsorize(if_else(true, multiply(open, 2), ts_delta(volume, 5)), std=2))",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn custom_operator_parent_retains_lineage_during_field_mutation() {
+        let mut catalog = operators::builtin_catalog().clone();
+        let mut custom = catalog.lookup("rank").unwrap().clone();
+        custom.name = "custom_order".into();
+        catalog.operators.push(custom);
+        catalog.validate().unwrap();
+        let parent = parse_expression_with_catalog("custom_order(close)", &catalog).unwrap();
+        for ordinal in 0..32 {
+            let result = mutate_with_class_and_catalog(
+                &parent,
+                MutationClass::Field,
+                71,
+                ordinal,
+                &Limits::default(),
+                &catalog,
+            );
+            assert_eq!(result.1.kind, TransformKind::Mutation);
+            assert_eq!(result.0.operator(), Some("custom_order"));
+            assert_eq!(
+                result.1.parent_fingerprints,
+                vec![semantic_fingerprint(&parent)]
+            );
+            validate_transformed_with_catalog(&result.0, &Limits::default(), &catalog).unwrap();
+            assert_eq!(
+                result,
+                mutate_with_class_and_catalog(
+                    &parent,
+                    MutationClass::Field,
+                    71,
+                    ordinal,
+                    &Limits::default(),
+                    &catalog,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn exact_three_argument_window_is_not_a_free_scalar() {
+        let parent = parse_expression("ts_corr(close, open, 20)").unwrap();
+        let path = ExprPath {
+            segments: vec![PathSegment::VariadicArg { index: 2 }],
+        };
+        assert!(is_window_path(&parent, &path, operators::builtin_catalog()));
+        for ordinal in 0..32 {
+            let (child, provenance) = mutate_with_class(
+                &parent,
+                MutationClass::Window,
+                71,
+                ordinal,
+                &Limits::default(),
+            );
+            assert_eq!(provenance.kind, TransformKind::Mutation);
+            assert_eq!(provenance.affected_path.as_ref(), Some(&path));
+            validate_transformed(&child, &Limits::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_operator_crossover_preserves_catalog_and_lineage() {
+        let mut catalog = operators::builtin_catalog().clone();
+        let mut custom = catalog.lookup("rank").unwrap().clone();
+        custom.name = "custom_order".into();
+        catalog.operators.push(custom);
+        catalog.validate().unwrap();
+        let left = parse_expression_with_catalog("custom_order(close)", &catalog).unwrap();
+        let right = parse_expression_with_catalog("custom_order(open)", &catalog).unwrap();
+        for ordinal in 0..32 {
+            let result =
+                crossover_with_catalog(&left, &right, 71, ordinal, &Limits::default(), &catalog);
+            assert_eq!(result.1.kind, TransformKind::Crossover);
+            assert_eq!(result.0.operator(), Some("custom_order"));
+            assert_eq!(
+                result.1.parent_fingerprints,
+                vec![semantic_fingerprint(&left), semantic_fingerprint(&right)]
+            );
+            validate_transformed_with_catalog(&result.0, &Limits::default(), &catalog).unwrap();
+            assert_eq!(
+                result,
+                crossover_with_catalog(&left, &right, 71, ordinal, &Limits::default(), &catalog)
+            );
+        }
     }
 
     #[test]

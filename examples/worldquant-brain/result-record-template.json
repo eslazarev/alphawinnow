@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "purpose": "illustrative adapter-owned record; not an AlphaWinnow or BRAIN request schema",
+  "market_evidence": false,
+  "record_id": "example-only-not-a-platform-id",
+  "source_expression": "rank(negate(returns))",
+  "source_semantic_fingerprint": null,
+  "wire_expression": null,
+  "settings_checksum": null,
+  "evaluator_context": null,
+  "status": "not_submitted",
+  "external_id": null,
+  "metrics": null,
+  "checks": null,
+  "objective_version": null,
+  "outcome": null,
+  "failure_reason": null,
+  "submission_allowed": false
+}

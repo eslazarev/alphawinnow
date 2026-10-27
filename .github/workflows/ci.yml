@@ -93,6 +93,15 @@ jobs:
       - name: Test all features
         run: cargo test --workspace --locked --all-features
 
+      - name: Verify the offline WorldQuant BRAIN guide examples
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build -p alphawinnow --bin alphawinnow --example measured_search_stdio --locked
+          python3 examples/worldquant-brain/demo.py \
+            --cli target/debug/alphawinnow \
+            --bridge target/debug/examples/measured_search_stdio \
+            --output "${RUNNER_TEMP}/alphawinnow-brain-guide"
+
   features:
     name: Features (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -126,6 +135,10 @@ jobs:
       - name: Run the synthetic ask/tell example without CLI dependencies
         if: matrix.name == 'library only'
         run: cargo run --example measured_search --no-default-features --locked
+
+      - name: Run the synthetic warm-start and screened-feedback example
+        if: matrix.name == 'library only'
+        run: cargo run --example adaptive_measured_search --no-default-features --locked
 
   library-graph:
     name: Library dependency guard

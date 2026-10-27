@@ -23,10 +23,29 @@ AlphaWinnow is not a trading bot, broker integration, or hosted alpha database.
 It runs locally, performs no network requests, and never claims that a generated
 formula is profitable.
 
-## What's new in 0.2.0
+Working with WorldQuant BRAIN? Start with the
+[detailed workflow and runnable example files](docs/worldquant-brain.md).
 
-This checkout prepares **0.2.0**; publication is a separate release step.
-The release adds a bounded ask/tell library API for caller-measured search,
+## What's new in 0.3.0
+
+This checkout prepares **0.3.0**; publication is a separate release step.
+
+- **Reuse measured history:** warm-start ask/tell search from audited parents
+  and exclude previously explored semantic identities.
+- **Measure a selected subset:** update parents from actual measurements while
+  keeping screened-out proposals unlabelled and budgets explicit.
+- **Audit before trusting guidance:** evaluate against separate held-out
+  feedback and screen candidates with an explicit threshold and abstention.
+- **Keep custom catalogs intact:** mutation and crossover now preserve custom
+  operator typing, including positional rolling-window arguments.
+- **Resume precisely:** preserve finite outcome bits in JSON and reject
+  incomplete retained-parent checkpoints.
+
+This is a pre-1.0 breaking release: public error variants were added, and
+corrected transforms can change seeded output. Read the
+[release and migration notes](docs/releases/0.3.0.md) before upgrading.
+
+Version 0.2.0 added a bounded ask/tell library API for caller-measured search,
 opt-in feedback-guided search policies, and an expanded causal numeric operator
 backend. It also changes semantic identity for nested cross-sectional ranks
 and upgrades search artifact schemas. See the [changelog](CHANGELOG.md) and
@@ -178,11 +197,14 @@ pulling in a command-line stack:
 
 ```toml
 [dependencies]
-alphawinnow = { version = "0.2", default-features = false }
+alphawinnow = { version = "0.3", default-features = false }
 
 # With optional causal numeric evaluation and local Parquet preparation:
-# alphawinnow = { version = "0.2", default-features = false, features = ["parquet-input"] }
+# alphawinnow = { version = "0.3", default-features = false, features = ["parquet-input"] }
 ```
+
+Use the registry dependency after publication. To test this prepared checkout
+before release, use a local path dependency on `crates/alphawinnow` instead.
 
 ```rust
 use alphawinnow::{analyze_expression, parse_expression, semantic_fingerprint};
@@ -225,6 +247,75 @@ the same public API over local JSONL; it is an example, not a hosted service.
 The session bounds attempts, emitted proposals, batch/parent counts, and AST
 complexity. It does not time-limit the caller's evaluator. Budget rescoring
 and evaluation time explicitly; `max_evaluations` counts new proposals only.
+JSON checkpoints preserve finite outcome bits (including signed zero), and
+restoration rejects incomplete retained-parent populations. Checkpoints are
+validated for consistency, not authenticated against deliberate tampering.
+
+For an adaptive warm start, `MeasuredSearchSession::from_measured_parents`
+imports caller-audited `MeasuredSeed` records (record ID, expression, outcome)
+and an all-history set of AlphaWinnow semantic fingerprints. Seeds must share
+the declared evaluator/settings/reference-pool context and fit parent capacity.
+They do not consume new-proposal budget; `imported()` reports them separately.
+Both successful and failed historical expressions can be excluded. Do not pass
+hashes from another engine: compute identities with this library and catalog.
+
+After `ask()`, an external selector may measure only part of the pool.
+`tell_screened()` accepts every incumbent's score plus at least one measured
+pending proposal. The omitted proposals remain deduplicated, but receive **no
+fabricated failure label**. `measured()` counts newly measured proposals;
+`screened_out()` counts omitted ones. Both count against `max_evaluations`,
+which limits generated proposals, **not external API calls**. Keep a separate
+durable external budget and save the selected subset before starting evaluation.
+For example, `max_evaluations = 32`, `batch_size = 8`, and selecting two per
+batch yields **8 measured + 24 screened**, not 32 measurements. The historical
+field name is retained for config compatibility; it is a **proposal budget**.
+Do not treat missing, timed-out or uncertain responses as screening decisions.
+
+Warm starts and screened feedback support `Score` and `ScoreDiverseV1` policies.
+New measured winners can replace imported parents and drive the next batch.
+They use measured-search checkpoint schema 2; existing unbootstrapped,
+fully measured sessions retain schema 1 and their original serialization.
+The JSONL example exposes `init_measured` and `tell_screened` as well as the
+existing operations. This is an offline integration API: it does not implement
+external simulation, submission, surrogate refitting, or a live-budget ledger.
+
+Large exclusion archives can be stored once instead of embedding them in every
+checkpoint. The opt-in Rust API uses a schema-3 envelope and a SHA-256 reference:
+
+```rust,ignore
+// Persist this archive atomically BEFORE the first referenced checkpoint.
+let history = session.excluded_history().expect("bootstrapped session").clone();
+let archive_json = history.to_json()?;
+let archive_key = history.checksum();
+// Save archive_json under archive_key; keep it for as long as a checkpoint refers to it.
+let checkpoint = session.checkpoint_with_history_json()?;
+let restored = MeasuredSearchSession::from_checkpoint_with_history_json(
+    &checkpoint, config, catalog, &history,
+)?;
+```
+
+After a process restart, load the archive with `ExcludedHistory::from_json` once
+and reuse it. Wrong or missing archives fail closed; there is no network fetch or
+automatic path lookup. Seeds and evolving state remain inline. Archive cloning
+shares immutable storage; validation of config, catalog, parents, and pending
+proposals is not skipped. Checksums detect mismatches, not malicious tampering.
+`checkpoint_json()` still writes a standalone schema-1/2 artifact, and the stdio
+example continues to use that format. The caller owns durable archive/checkpoint
+publication. Benchmark both modes with:
+
+```bash
+cargo run --release --no-default-features --example checkpoint_history --locked
+```
+
+Run the complete synthetic warm-start/screen/update/checkpoint loop:
+
+```bash
+cargo run --example adaptive_measured_search --no-default-features --locked
+```
+
+It imports two toy measurements, proposes 32 formulas in four batches, and
+measures two proposals per batch. The other 24 are screened out without labels.
+Its toy selector and negative-node-count objective provide no market evidence.
 
 ## How it works
 
@@ -264,7 +355,8 @@ metric can never silently masquerade as a remote-platform result.
 | `search` | Run bounded parallel expression discovery |
 | `benchmark` | Compare reproducible one/many-thread workloads |
 | `prioritize` | Re-rank candidates using immutable measured feedback |
-| `audit-feedback` | Audit feedback guidance with leave-one-out evaluation |
+| `screen-feedback` | Apply an explicit feedback threshold and retain every decision |
+| `audit-feedback` | Audit guidance with leave-one-out or separate held-out evaluation |
 | `compile` | Lower and lint an expression against a target dialect |
 | `evaluate` | Evaluate one expression on local data (optional feature) |
 | `evaluate-batch` | Evaluate candidate JSONL in bounded batches (optional) |
@@ -328,6 +420,16 @@ alphawinnow audit-feedback \
   --neighbors 8 \
   --minimum-neighbors 3
 ```
+
+For separate held-out evaluation and explicit abstention, see
+[measured-feedback prioritization](#measured-feedback-prioritization).
+
+Library callers can additionally opt into `field_diversity::select_field_diverse`
+to cap repeated field sets while retaining deferred indices, and
+`identity_reduction::reduce_unit_scaling` to remove exact multiplication/division
+by one. Neither changes default search or semantic hashes. If adopting the
+reducer, version your dedup policy and apply it to history and new candidates
+alike; different field sets do not establish independent returns.
 
 ### Run local factor evaluation
 
@@ -636,6 +738,77 @@ before `evaluation_start` are warm-up only. The adapter never contacts a data
 vendor or platform, never writes into the source lake, and refuses to
 overwrite an existing output file.
 
+## Using AlphaWinnow with WorldQuant BRAIN
+
+**[Read the detailed WorldQuant BRAIN guide](docs/worldquant-brain.md)** —
+step-by-step explanations, downloadable JSON files, an executable offline demo,
+JSONL feedback/checkpoint walkthroughs, and integration troubleshooting.
+
+AlphaWinnow can serve as the **local candidate-search engine** in a WorldQuant
+BRAIN research workflow. It is not a BRAIN connector or a complete FASTEXPR
+implementation. The public crate generates and tracks research hypotheses;
+your own integration handles platform-specific syntax, settings and evaluation.
+
+| Stage | AlphaWinnow | Your external workflow |
+| --- | --- | --- |
+| Define the search space | Validate a supplied typed field/operator catalog | Maintain the fields and operators available to your account and their correct types |
+| Find candidates | Generate, mutate, deduplicate and retain lineage | Define economic hypotheses and choose what deserves a simulation |
+| Evaluate | Accept caller-supplied measured outcomes; optionally evaluate local data | Run BRAIN simulations and retain exact expressions, settings, metrics and checks |
+| Continue or submit | Update measured parents and restore checkpoints | Own simulation budgets, request recovery, current platform checks and submission decisions |
+
+### Start with a bounded local shortlist
+
+Create a local catalog using AlphaWinnow's catalog schema, restricted to the
+fields, signatures and parameter domains you have verified. An account's raw
+catalog export is not automatically an AlphaWinnow catalog. No proprietary
+BRAIN field catalog or account data is bundled here.
+
+```bash
+alphawinnow search \
+  --catalog my-brain-catalog.json \
+  --output brain-candidates.jsonl \
+  --max-candidates 10000 \
+  --duration-seconds 60 \
+  --threads 2 \
+  --seed 7
+```
+
+`my-brain-catalog.json` is a caller-created file, not a supplied example.
+This command makes **zero platform requests**. Its candidate ceiling is a local
+search limit, not a BRAIN simulation quota. Translate and validate the shortlisted
+expressions in your adapter; familiar operator names do not establish identical
+syntax, missing-value behavior or numerical semantics. The generic
+[`compile` command](#target-dialect-compile-and-lint) helps with its supported
+lowerings, but is not a universal BRAIN transpiler.
+
+### Feed real simulation results back into search
+
+Use the [measured-search API](#drive-search-with-your-own-evaluator) or its local
+JSONL example to connect an evaluator in another language. Warm-start from
+audited measurements, exclude historical semantic identities, measure a selected
+subset, and return outcomes with `tell_screened`. Define a versioned objective
+and evaluator context that identifies the data, period, universe, delay,
+neutralization, decay and other relevant settings. Do not silently reuse labels
+from a different context or assign failure scores to unknown responses.
+
+Keep API credentials, licensed catalogs, private formulas and simulation logs
+outside the public repository. Your adapter must preserve the expression-to-result
+mapping and handle durable quotas, ambiguous requests and retries. AlphaWinnow
+does not perform authentication, API calls, scheduling or alpha submission.
+
+### A shortlist is not submission clearance
+
+`structural_score` measures formula structure, not BRAIN Sharpe, Fitness or
+acceptance probability. Local `brain-proxy-v1` metrics are explicitly estimates;
+different data and evaluation conventions can produce different results. Passing
+local validation or a historical simulation does not establish current submission
+eligibility, low correlation with your current book, or parameter robustness.
+Check these separately using the platform and appropriate independent validation.
+
+AlphaWinnow is independent and is not affiliated with or endorsed by WorldQuant.
+Use external integrations only as permitted by the applicable platform and data
+terms.
+
 ## Target-dialect compile and lint
 
 `compile` lowers an expression against an immutable, user-supplied dialect
@@ -694,6 +867,54 @@ signs exist). This is a deterministic leakage check for comparing feature sets
 or neighbor settings, not evidence that the supplied outcomes generalize to a
 new dataset or context.
 
+To evaluate against **separate frozen evidence**, supply a second dataset:
+
+```bash
+alphawinnow audit-feedback \
+  --feedback training-feedback.json \
+  --evaluation-feedback heldout-feedback.json
+```
+
+This mode never uses evaluation labels as neighbors. It emits per-record
+predictions, aggregate metrics, both dataset checksums, and the neighbor
+configuration. Context, outcome label, and feature scales must match exactly;
+overlapping record IDs or supplied semantic fingerprints fail closed. The caller
+must still enforce temporal and economic-family separation: absent fingerprints,
+renamed duplicates, and related formulas cannot be inferred from anonymous
+features. A historical split is not a fresh prospective test.
+
+Ranking always returns a best item, even when every estimate is poor. To make
+abstention explicit, use a threshold chosen **before observing evaluation results**:
+
+```bash
+alphawinnow screen-feedback \
+  --input candidates.jsonl --feedback training-feedback.json \
+  --minimum-conservative-outcome 0 --output screening.json
+```
+
+Unlike `prioritize`, this writes one atomic schema-2 JSON report containing **all**
+candidates, unchanged guidance and structural scores, and `eligible`,
+`below_threshold`, or `missing_guidance` decisions. Equality passes the threshold;
+missing guidance never does. Zero eligible candidates is a valid result; no
+structural fallback fills a budget. Zero is only an example in the supplied
+label's units, not a universal threshold. The conservative score is a neighbor
+dispersion heuristic, **not** a calibrated probability or statistical confidence
+bound. Eligibility does not establish robustness, profitability, or platform
+acceptance. Deliberate exploration must be separately budgeted by the caller.
+
+For larger output, add `--format jsonl --output screening.jsonl`. The first line
+is `{"schema":2,"type":"metadata",...}`; subsequent lines are
+`{"schema":2,"type":"candidate","record":{...}}`. Both formats retain every
+decision and the same metadata. JSONL serialization buffers one record at a
+time, but input loading and ranking still operate in memory.
+
+`candidate_records_checksum` hashes the ordered parsed input records as a compact
+JSON array; `input_file_checksum` hashes the exact original file bytes, including
+whitespace. The CLI computes that hash in the same read used for parsing. The
+library's slice-based `screen_candidates` leaves the file checksum `null` unless
+the caller supplies it. Neither checksum is the output hash: the CLI separately
+reports `content_checksum`. The feedback identity remains `feedback_checksum`.
+
 Measured evidence can also guide the structural search's parent selection:
 
 ```bash
@@ -722,6 +943,10 @@ also changed. `--catalog-scaffold-policy` separately selects `fixed`,
 remains an alias for seeded-diverse coverage.
 
 ## Reproducible benchmark
+
+The current release's synthetic structural report and reproduction command are
+linked from the [0.3.0 release notes](docs/releases/0.3.0.md). Historical reports
+describe their own source snapshots, not current-version speed or output parity.
 
 Command (structural-search throughput, not predictive performance):
 
@@ -862,6 +1087,9 @@ execution simulator: there is no broker, exchange, fill, latency, or live
 trading model.
 
 ### Does it support WorldQuant BRAIN or FASTEXPR formulas?
+
+See [Using AlphaWinnow with WorldQuant BRAIN](#using-alphawinnow-with-worldquant-brain)
+for the local-search workflow and the external integration boundary.
 
 The bundled DSL contains familiar WorldQuant-style time-series,
 cross-sectional, arithmetic, group, and conditional operators. AlphaWinnow has

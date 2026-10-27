@@ -86,3 +86,11 @@ cargo test --workspace --all-features
 
 When a proposed optimization conflicts with correctness or reproducibility,
 keep the simpler behavior until the faster version can demonstrate parity.
+
+## Reporting evidence
+
+User preference recorded on 2026-09-09: report only verified facts as facts.
+Clearly label hypotheses, estimates, and untested assumptions. Distinguish
+planned, started, completed, and verified work; cite the concrete artifact or
+check behind a result. Do not claim service availability before a real request
+succeeds, or benchmark reproduction before the declared protocol completes.

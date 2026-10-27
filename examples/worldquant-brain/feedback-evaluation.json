@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "dataset_id": "guide-synthetic-evaluation-v1",
+  "context_checksum": "guide-synthetic-feedback-no-market-data",
+  "outcome_label": "toy bounded utility, not Sharpe or platform PASS",
+  "feature_scales": {"depth": 10.0, "nodes": 40.0},
+  "records": [
+    {"record_id": "eval-a", "features": {"depth": 1.0, "nodes": 2.0}, "outcome": -0.5, "confidence": 1.0},
+    {"record_id": "eval-b", "features": {"depth": 3.0, "nodes": 5.0}, "outcome": 0.1, "confidence": 1.0}
+  ]
+}

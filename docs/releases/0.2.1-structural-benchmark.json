@@ -1,0 +1,173 @@
+{
+  "candidate_ceiling": 20000,
+  "deterministic_across_repetitions_and_thread_counts": true,
+  "engineering_checks": {
+    "bounded_populations": true,
+    "duplicate_rejection_observed": true,
+    "zero_invalid_emissions": true
+  },
+  "environment": {
+    "architecture": "aarch64",
+    "os": "macos"
+  },
+  "repetitions": 1,
+  "schema": 1,
+  "seed": 20260828,
+  "seeds": [
+    20260828
+  ],
+  "tool_version": "0.2.1",
+  "trials": [
+    {
+      "accepted_transform_counts": {
+        "crossover": 11707,
+        "fallback_generation": 1751,
+        "initial": 64,
+        "mutation": 3663
+      },
+      "archived_candidates": 17185,
+      "attempted_candidates": 20000,
+      "attempted_candidates_per_second": 2123.313839985211,
+      "candidate_checksum": "6be91f1d598fb4d013d413ad4952f60b869398ec53ac02edee1b3c3f92ff9d42",
+      "configuration": {
+        "duration_seconds": 3600,
+        "limits": {
+          "max_depth": 6,
+          "max_nodes": 40,
+          "max_operators": 16,
+          "max_scalar_abs": 1000,
+          "max_window": 252,
+          "min_window": 2
+        },
+        "max_candidates": 20000,
+        "resources": {
+          "descriptor_archive_capacity": 4096,
+          "elite_archive_capacity": 4096,
+          "finalization_reserve_milliseconds": 250,
+          "parent_pool_capacity": 128,
+          "population_capacity": 512,
+          "semantic_archive_capacity": 100000
+        },
+        "schema": 2,
+        "scoring": {
+          "archive_novelty_weight": 0.15,
+          "family_diversity_weight": 0.1,
+          "lineage_diversity_weight": 0.1,
+          "schema": 1,
+          "simplicity_weight": 0.2,
+          "structural_novelty_weight": 0.35,
+          "transform_diversity_weight": 0.1
+        },
+        "seed": 20260828,
+        "shortlist_size": 100,
+        "threads": 1
+      },
+      "duplicate_rate": 0.13845,
+      "evaluated_candidates": 17185,
+      "generated_candidates": 20000,
+      "generations_completed": 157,
+      "invalid_rate": 0,
+      "peak_population": 512,
+      "population_capacity": 512,
+      "rejected_duplicate_candidates": 2769,
+      "rejected_invalid_candidates": 0,
+      "rejected_trivial_candidates": 46,
+      "rejection_reasons": {
+        "provably_constant": 9,
+        "provably_zero": 37
+      },
+      "repetition": 1,
+      "retained_candidates": 100,
+      "retained_transform_counts": {
+        "crossover": 16,
+        "fallback_generation": 16,
+        "initial": 50,
+        "mutation": 18
+      },
+      "seed": 20260828,
+      "semantic_families": 17185,
+      "semantic_families_per_second": 1824.4574170072926,
+      "semantic_family_yield": 0.85925,
+      "threads": 1,
+      "trivial_rate": 0.0023,
+      "valid_candidates": 17185,
+      "wall_milliseconds": 9419
+    },
+    {
+      "accepted_transform_counts": {
+        "crossover": 11707,
+        "fallback_generation": 1751,
+        "initial": 64,
+        "mutation": 3663
+      },
+      "archived_candidates": 17185,
+      "attempted_candidates": 20000,
+      "attempted_candidates_per_second": 7950.542590801645,
+      "candidate_checksum": "6be91f1d598fb4d013d413ad4952f60b869398ec53ac02edee1b3c3f92ff9d42",
+      "configuration": {
+        "duration_seconds": 3600,
+        "limits": {
+          "max_depth": 6,
+          "max_nodes": 40,
+          "max_operators": 16,
+          "max_scalar_abs": 1000,
+          "max_window": 252,
+          "min_window": 2
+        },
+        "max_candidates": 20000,
+        "resources": {
+          "descriptor_archive_capacity": 4096,
+          "elite_archive_capacity": 4096,
+          "finalization_reserve_milliseconds": 250,
+          "parent_pool_capacity": 128,
+          "population_capacity": 512,
+          "semantic_archive_capacity": 100000
+        },
+        "schema": 2,
+        "scoring": {
+          "archive_novelty_weight": 0.15,
+          "family_diversity_weight": 0.1,
+          "lineage_diversity_weight": 0.1,
+          "schema": 1,
+          "simplicity_weight": 0.2,
+          "structural_novelty_weight": 0.35,
+          "transform_diversity_weight": 0.1
+        },
+        "seed": 20260828,
+        "shortlist_size": 100,
+        "threads": 4
+      },
+      "duplicate_rate": 0.13845,
+      "evaluated_candidates": 17185,
+      "generated_candidates": 20000,
+      "generations_completed": 157,
+      "invalid_rate": 0,
+      "peak_population": 512,
+      "population_capacity": 512,
+      "rejected_duplicate_candidates": 2769,
+      "rejected_invalid_candidates": 0,
+      "rejected_trivial_candidates": 46,
+      "rejection_reasons": {
+        "provably_constant": 9,
+        "provably_zero": 37
+      },
+      "repetition": 1,
+      "retained_candidates": 100,
+      "retained_transform_counts": {
+        "crossover": 16,
+        "fallback_generation": 16,
+        "initial": 50,
+        "mutation": 18
+      },
+      "seed": 20260828,
+      "semantic_families": 17185,
+      "semantic_families_per_second": 6831.503721146313,
+      "semantic_family_yield": 0.85925,
+      "threads": 4,
+      "trivial_rate": 0.0023,
+      "valid_candidates": 17185,
+      "wall_milliseconds": 2515
+    }
+  ],
+  "workload": "deterministic_structural_search"
+}

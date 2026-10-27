@@ -1,8 +1,9 @@
 //! Offline measured-feedback guidance kept separate from structural scoring.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, io::Write, path::Path};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{CandidateRecord, Catalog, StructuralDescriptor, artifact, canonical::digest};
@@ -217,6 +218,61 @@ pub struct FeedbackAuditReport {
     pub roc_auc: Option<f64>,
 }
 
+/// Independent evaluation against frozen training evidence. Splitting by time
+/// and economic family remains the caller's responsibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackHoldoutReport {
+    pub schema: u32,
+    pub training_dataset_id: String,
+    pub training_checksum: String,
+    pub training_records: usize,
+    pub context_checksum: String,
+    pub outcome_label: String,
+    pub config: FeedbackConfig,
+    pub metrics: FeedbackAuditReport,
+    pub predictions: Vec<FeedbackPrediction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackPrediction {
+    pub record_id: String,
+    pub actual_outcome: f64,
+    pub guidance: Option<GuidanceEstimate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackAdmission {
+    Eligible,
+    MissingGuidance,
+    BelowThreshold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenedCandidate {
+    pub guided: GuidedCandidate,
+    pub decision: FeedbackAdmission,
+}
+
+/// An explicit research-screening decision, never a trading or submission gate.
+/// All rejected candidates are retained; an empty eligible set is valid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackScreenReport {
+    pub schema: u32,
+    /// SHA-256 of the ordered, parsed input records serialized as a JSON array.
+    pub candidate_records_checksum: String,
+    /// SHA-256 of original input file bytes, when supplied by a file-based caller.
+    pub input_file_checksum: Option<String>,
+    pub feedback_checksum: String,
+    pub context_checksum: String,
+    pub outcome_label: String,
+    pub config: FeedbackConfig,
+    pub minimum_conservative_outcome: f64,
+    pub eligible_records: usize,
+    pub rejected_records: usize,
+    pub records: Vec<ScreenedCandidate>,
+}
+
 /// Bounded opt-in conversion of measured operator outcomes into catalog weights.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorPolicyConfig {
@@ -285,6 +341,14 @@ pub enum FeedbackError {
     InvalidOperatorPolicy,
     #[error("feedback has no supported operator-count evidence")]
     NoOperatorPolicyEvidence,
+    #[error(
+        "training and evaluation must have identical context, outcome label, and feature scales"
+    )]
+    HoldoutContextMismatch,
+    #[error("training and evaluation overlap in record IDs or semantic fingerprints")]
+    HoldoutOverlap,
+    #[error("minimum_conservative_outcome must be finite and within [-1, 1]")]
+    InvalidAdmissionThreshold,
     #[error(transparent)]
     Artifact(#[from] artifact::ArtifactError),
 }
@@ -837,6 +901,207 @@ pub fn audit_feedback(
             .map(|estimate| (record.outcome, estimate.weighted_outcome))
         })
         .collect::<Vec<_>>();
+    Ok(audit_metrics(dataset, checksum, &estimates))
+}
+
+/// Evaluate only against a separate, frozen training dataset. Evaluation labels
+/// are never neighbors. Rejects known identity overlap, not unprovided family
+/// relationships; callers must also separate economic families and time periods.
+///
+/// # Errors
+/// Rejects malformed inputs, context/feature-scale/label mismatches and known
+/// record-ID or semantic-fingerprint overlap between the two datasets.
+pub fn audit_feedback_holdout(
+    training: &FeedbackDataset,
+    evaluation: &FeedbackDataset,
+    config: &FeedbackConfig,
+) -> Result<FeedbackHoldoutReport, FeedbackError> {
+    training.validate()?;
+    evaluation.validate()?;
+    config.validate()?;
+    if training.context_checksum != evaluation.context_checksum
+        || training.outcome_label != evaluation.outcome_label
+        || training.feature_scales != evaluation.feature_scales
+    {
+        return Err(FeedbackError::HoldoutContextMismatch);
+    }
+    let ids: std::collections::BTreeSet<_> =
+        training.records.iter().map(|r| &r.record_id).collect();
+    let fingerprints: std::collections::BTreeSet<_> = training
+        .records
+        .iter()
+        .filter_map(|r| r.semantic_fingerprint.as_ref())
+        .collect();
+    if evaluation.records.iter().any(|r| {
+        ids.contains(&r.record_id)
+            || r.semantic_fingerprint
+                .as_ref()
+                .is_some_and(|fp| fingerprints.contains(fp))
+    }) {
+        return Err(FeedbackError::HoldoutOverlap);
+    }
+    let training_checksum = training.checksum();
+    let mut predictions: Vec<_> = evaluation
+        .records
+        .iter()
+        .map(|record| FeedbackPrediction {
+            record_id: record.record_id.clone(),
+            actual_outcome: record.outcome,
+            guidance: estimate(&record.features, training, config, &training_checksum),
+        })
+        .collect();
+    predictions.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+    let estimates: Vec<_> = predictions
+        .iter()
+        .filter_map(|p| {
+            p.guidance
+                .as_ref()
+                .map(|g| (p.actual_outcome, g.weighted_outcome))
+        })
+        .collect();
+    Ok(FeedbackHoldoutReport {
+        schema: 1,
+        training_dataset_id: training.dataset_id.clone(),
+        training_checksum,
+        training_records: training.records.len(),
+        context_checksum: training.context_checksum.clone(),
+        outcome_label: training.outcome_label.clone(),
+        config: config.clone(),
+        metrics: audit_metrics(evaluation, evaluation.checksum(), &estimates),
+        predictions,
+    })
+}
+
+/// Screen ranked candidates using an explicit threshold in the supplied label's
+/// units. Missing guidance fails closed. No quota-filling or structural fallback.
+/// The conservative score is a heuristic, not a calibrated confidence bound.
+///
+/// # Errors
+/// Rejects invalid feedback/configuration or a threshold outside [-1, 1].
+pub fn screen_candidates(
+    candidates: &[CandidateRecord],
+    dataset: &FeedbackDataset,
+    config: &FeedbackConfig,
+    minimum_conservative_outcome: f64,
+) -> Result<FeedbackScreenReport, FeedbackError> {
+    if !minimum_conservative_outcome.is_finite()
+        || !(-1.0..=1.0).contains(&minimum_conservative_outcome)
+    {
+        return Err(FeedbackError::InvalidAdmissionThreshold);
+    }
+    let records: Vec<_> = prioritize_candidates(candidates, dataset, config)?
+        .into_iter()
+        .map(|guided| {
+            let decision = match &guided.measured_guidance {
+                None => FeedbackAdmission::MissingGuidance,
+                Some(g) if g.conservative_outcome < minimum_conservative_outcome => {
+                    FeedbackAdmission::BelowThreshold
+                }
+                Some(_) => FeedbackAdmission::Eligible,
+            };
+            ScreenedCandidate { guided, decision }
+        })
+        .collect();
+    let eligible_records = records
+        .iter()
+        .filter(|r| r.decision == FeedbackAdmission::Eligible)
+        .count();
+    Ok(FeedbackScreenReport {
+        schema: 2,
+        candidate_records_checksum: candidate_records_checksum(candidates)?,
+        input_file_checksum: None,
+        feedback_checksum: dataset.checksum(),
+        context_checksum: dataset.context_checksum.clone(),
+        outcome_label: dataset.outcome_label.clone(),
+        config: config.clone(),
+        minimum_conservative_outcome,
+        eligible_records,
+        rejected_records: records.len() - eligible_records,
+        records,
+    })
+}
+
+fn candidate_records_checksum(candidates: &[CandidateRecord]) -> Result<String, FeedbackError> {
+    let mut checksum = Sha256::new();
+    checksum.update(b"[");
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index > 0 {
+            checksum.update(b",");
+        }
+        checksum.update(serde_json::to_vec(candidate).map_err(artifact::ArtifactError::from)?);
+    }
+    checksum.update(b"]");
+    Ok(format!("{:x}", checksum.finalize()))
+}
+
+/// Atomically persist every screening decision in one auditable artifact.
+///
+/// # Errors
+/// Returns an error on serialization or durable replacement failure.
+pub fn write_feedback_screen_atomic(
+    path: &Path,
+    report: &FeedbackScreenReport,
+) -> Result<String, FeedbackError> {
+    let content = serde_json::to_string(report).map_err(artifact::ArtifactError::from)?;
+    artifact::atomic_write(path, content.as_bytes())?;
+    Ok(digest(&content))
+}
+
+/// Atomically write a schema-2 metadata header followed by one decision per line.
+/// Serialization uses one record buffer at a time; screening itself is in-memory.
+/// Returns the SHA-256 of the exact output bytes, including newlines.
+///
+/// # Errors
+/// Returns an error on serialization or durable replacement failure.
+pub fn write_feedback_screen_jsonl_atomic(
+    path: &Path,
+    report: &FeedbackScreenReport,
+) -> Result<String, FeedbackError> {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        schema: u32,
+        #[serde(rename = "type")]
+        kind: &'static str,
+        record: &'a ScreenedCandidate,
+    }
+    let metadata = serde_json::json!({
+        "schema": report.schema,
+        "type": "metadata",
+        "candidate_records_checksum": report.candidate_records_checksum,
+        "input_file_checksum": report.input_file_checksum,
+        "feedback_checksum": report.feedback_checksum,
+        "context_checksum": report.context_checksum,
+        "outcome_label": report.outcome_label,
+        "config": report.config,
+        "minimum_conservative_outcome": report.minimum_conservative_outcome,
+        "eligible_records": report.eligible_records,
+        "rejected_records": report.rejected_records,
+    });
+    Ok(artifact::atomic_write_with(path, |file| {
+        let mut checksum = Sha256::new();
+        let mut write_line = |mut bytes: Vec<u8>| -> std::io::Result<()> {
+            bytes.push(b'\n');
+            file.write_all(&bytes)?;
+            checksum.update(&bytes);
+            Ok(())
+        };
+        write_line(serde_json::to_vec(&metadata)?)?;
+        for record in &report.records {
+            write_line(serde_json::to_vec(&Row {
+                schema: report.schema,
+                kind: "candidate",
+                record,
+            })?)?;
+        }
+        Ok(format!("{:x}", checksum.finalize()))
+    })?)
+}
+
+fn audit_metrics(
+    dataset: &FeedbackDataset,
+    checksum: String,
+    estimates: &[(f64, f64)],
+) -> FeedbackAuditReport {
     let evaluated = estimates.len();
     let total = dataset.records.len();
     let mean_absolute_error = (evaluated > 0).then(|| {
@@ -893,7 +1158,7 @@ pub fn audit_feedback(
         f64::midpoint(true_positive_rate, true_negative_rate)
     });
     let roc_auc = rank_auc(&signed);
-    Ok(FeedbackAuditReport {
+    FeedbackAuditReport {
         schema: 1,
         dataset_id: dataset.dataset_id.clone(),
         feedback_checksum: checksum,
@@ -906,7 +1171,7 @@ pub fn audit_feedback(
         sign_accuracy,
         balanced_sign_accuracy,
         roc_auc,
-    })
+    }
 }
 
 /// Atomically write guided records as deterministic JSONL.
@@ -1301,6 +1566,116 @@ mod tests {
             evidence.validate(),
             Err(FeedbackError::FeatureSet { .. })
         ));
+    }
+
+    #[test]
+    fn heldout_labels_never_influence_predictions_and_record_order_is_stable() {
+        let train = dataset(vec![record("train", 1.0, 1.0, -0.8)]);
+        let mut evaluation = dataset(vec![
+            record("test-b", 1.0, 1.0, 1.0),
+            record("test-a", 1.0, 1.0, 1.0),
+        ]);
+        let config = FeedbackConfig {
+            neighbors: 1,
+            minimum_neighbors: 1,
+            ..FeedbackConfig::default()
+        };
+        let first = audit_feedback_holdout(&train, &evaluation, &config).unwrap();
+        assert_eq!(first.metrics.sign_accuracy, Some(0.0));
+        assert_eq!(first.predictions[0].record_id, "test-a");
+        evaluation.records.reverse();
+        assert_eq!(
+            first,
+            audit_feedback_holdout(&train, &evaluation, &config).unwrap()
+        );
+        for record in &mut evaluation.records {
+            record.outcome = -1.0;
+        }
+        let changed = audit_feedback_holdout(&train, &evaluation, &config).unwrap();
+        assert_eq!(changed.metrics.sign_accuracy, Some(1.0));
+        for (before, after) in first.predictions.iter().zip(&changed.predictions) {
+            assert_eq!(before.guidance, after.guidance);
+        }
+    }
+
+    #[test]
+    fn holdout_rejects_overlap_and_mismatched_context_label_or_scales() {
+        let mut train = dataset(vec![record("train", 1.0, 1.0, 1.0)]);
+        let config = FeedbackConfig::default();
+        assert!(matches!(
+            audit_feedback_holdout(&train, &train, &config),
+            Err(FeedbackError::HoldoutOverlap)
+        ));
+        let mut evaluation = dataset(vec![record("test", 1.0, 1.0, -1.0)]);
+        train.records[0].semantic_fingerprint = Some("same".into());
+        evaluation.records[0].semantic_fingerprint = Some("same".into());
+        assert!(matches!(
+            audit_feedback_holdout(&train, &evaluation, &config),
+            Err(FeedbackError::HoldoutOverlap)
+        ));
+        evaluation.records[0].semantic_fingerprint = None;
+        for field in ["context", "label", "scales"] {
+            let mut different = evaluation.clone();
+            match field {
+                "context" => different.context_checksum = "another-context".into(),
+                "label" => different.outcome_label = "another-label".into(),
+                _ => {
+                    different.feature_scales.insert("depth".into(), 100.0);
+                }
+            }
+            assert!(matches!(
+                audit_feedback_holdout(&train, &different, &config),
+                Err(FeedbackError::HoldoutContextMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn heldout_reports_zero_coverage_without_fabricated_metrics() {
+        let train = dataset(vec![record("train", 1.0, 1.0, 1.0)]);
+        let evaluation = dataset(vec![record("test", 1.0, 1.0, -1.0)]);
+        let report =
+            audit_feedback_holdout(&train, &evaluation, &FeedbackConfig::default()).unwrap();
+        assert_eq!(report.metrics.evaluated_records, 0);
+        assert_eq!(report.metrics.unguided_records, 1);
+        assert_eq!(report.metrics.mean_absolute_error, None);
+        assert_eq!(report.metrics.roc_auc, None);
+        assert!(report.predictions[0].guidance.is_none());
+    }
+
+    #[test]
+    fn screen_retains_rejections_and_never_fills_from_structural_score() {
+        let candidates = vec![candidate("close", 1.0), candidate("rank(close)", 0.0)];
+        let train = dataset(vec![record("negative", 1.0, 1.0, -1.0)]);
+        let config = FeedbackConfig {
+            neighbors: 1,
+            minimum_neighbors: 1,
+            ..FeedbackConfig::default()
+        };
+        let ranked = prioritize_candidates(&candidates, &train, &config).unwrap();
+        let report = screen_candidates(&candidates, &train, &config, 0.0).unwrap();
+        assert_eq!(report.eligible_records, 0);
+        assert_eq!(report.rejected_records, 2);
+        for (record, original) in report.records.iter().zip(&ranked) {
+            assert_eq!(&record.guided, original);
+            assert_eq!(record.decision, FeedbackAdmission::BelowThreshold);
+        }
+        let equality = screen_candidates(&candidates, &train, &config, -1.0).unwrap();
+        assert_eq!(equality.eligible_records, 2);
+        let missing =
+            screen_candidates(&candidates, &train, &FeedbackConfig::default(), -1.0).unwrap();
+        assert!(
+            missing
+                .records
+                .iter()
+                .all(|r| r.decision == FeedbackAdmission::MissingGuidance)
+        );
+        for bad in [f64::NAN, f64::INFINITY, -1.01, 1.01] {
+            assert!(matches!(
+                screen_candidates(&candidates, &train, &config, bad),
+                Err(FeedbackError::InvalidAdmissionThreshold)
+            ));
+        }
     }
 
     fn operator_policy_dataset(records: &[(&str, f64, f64, f64)]) -> FeedbackDataset {

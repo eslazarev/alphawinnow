@@ -2,11 +2,14 @@
 //! Compile with `cargo build --example measured_search_stdio --no-default-features`.
 //! First send init, then alternate ask and tell; each response is one JSON line.
 
-use std::io::{self, BufRead, Write};
+use std::{
+    collections::BTreeSet,
+    io::{self, BufRead, Write},
+};
 
 use alphawinnow::{
     Catalog,
-    measured_search::{MeasuredOutcome, MeasuredSearchConfig, MeasuredSearchSession},
+    measured_search::{MeasuredOutcome, MeasuredSearchConfig, MeasuredSearchSession, MeasuredSeed},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -17,6 +20,14 @@ enum Request {
     Init {
         config: MeasuredSearchConfig,
         catalog: Catalog,
+    },
+    InitMeasured {
+        config: MeasuredSearchConfig,
+        catalog: Catalog,
+        evaluator_context: String,
+        pool_context: String,
+        seeds: Vec<MeasuredSeed>,
+        excluded: BTreeSet<String>,
     },
     Restore {
         config: MeasuredSearchConfig,
@@ -29,6 +40,11 @@ enum Request {
         pool_context: String,
         outcomes: Vec<MeasuredOutcome>,
     },
+    TellScreened {
+        evaluator_context: String,
+        pool_context: String,
+        outcomes: Vec<MeasuredOutcome>,
+    },
     Checkpoint,
 }
 
@@ -37,6 +53,30 @@ fn respond(
     request: Request,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     match request {
+        Request::InitMeasured {
+            config,
+            catalog,
+            evaluator_context,
+            pool_context,
+            seeds,
+            excluded,
+        } => {
+            if session.is_some() {
+                return Err("session already initialized".into());
+            }
+            let initialized = MeasuredSearchSession::from_measured_parents(
+                config,
+                catalog,
+                &evaluator_context,
+                &pool_context,
+                &seeds,
+                &excluded,
+            )?;
+            let imported = initialized.imported();
+            let measured = initialized.measured();
+            *session = Some(initialized);
+            Ok(json!({"initialized": true, "imported": imported, "measured": measured}))
+        }
         Request::Init { config, catalog } => {
             if session.is_some() {
                 return Err("session already initialized".into());
@@ -73,8 +113,21 @@ fn respond(
                     session.tell(&evaluator_context, &pool_context, &outcomes)?;
                     Ok(json!({"parents": session.parents(), "measured": session.measured()}))
                 }
+                Request::TellScreened {
+                    evaluator_context,
+                    pool_context,
+                    outcomes,
+                } => {
+                    session.tell_screened(&evaluator_context, &pool_context, &outcomes)?;
+                    Ok(
+                        json!({"parents": session.parents(), "measured": session.measured(),
+                        "screened_out": session.screened_out(), "imported": session.imported()}),
+                    )
+                }
                 Request::Checkpoint => Ok(json!({"checkpoint": session.checkpoint_json()?})),
-                Request::Init { .. } | Request::Restore { .. } => unreachable!(),
+                Request::Init { .. } | Request::InitMeasured { .. } | Request::Restore { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
