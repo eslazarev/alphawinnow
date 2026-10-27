@@ -119,6 +119,6 @@ mod tests {
             [0, 1]
         );
         assert_eq!(select_field_diverse(&rows, 9, cap).selected, [0]);
-        assert!(select_field_diverse(&[], 9, cap).selected.is_empty());
+        assert_eq!(select_field_diverse(&[], 9, cap).selected, [] as [usize; 0]);
     }
 }

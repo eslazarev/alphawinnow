@@ -1,6 +1,6 @@
 use alphawinnow::measured_search::{
     MeasuredExploration, MeasuredMutation, MeasuredOutcome, MeasuredParentSelection,
-    MeasuredSearchConfig, MeasuredSearchSession,
+    MeasuredProposal, MeasuredSearchConfig, MeasuredSearchSession,
 };
 use alphawinnow::{Limits, builtin_catalog};
 use proptest::prelude::*;
@@ -154,7 +154,7 @@ fn checkpoint_accepts_unfilled_capacity_and_short_final_batch_for_every_policy()
             assert_eq!(restored.checkpoint_json().unwrap(), checkpoint);
         }
         assert_eq!(session.measured(), 3);
-        assert!(session.ask().unwrap().is_empty());
+        assert_eq!(session.ask().unwrap(), [] as [MeasuredProposal; 0]);
     }
 }
 
@@ -648,7 +648,7 @@ fn measured_scores_choose_parents_and_change_descendants() {
     let mut right = session();
     let initial = left.ask().unwrap();
     assert_eq!(right.ask().unwrap(), initial);
-    assert!(left.parents().is_empty());
+    assert_eq!(left.parents(), [] as [MeasuredProposal; 0]);
     left.tell("synthetic-v1", "pool-0", &outcomes(&left, 1.0))
         .unwrap();
     let other_parent = initial

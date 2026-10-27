@@ -2385,7 +2385,7 @@ mod tests {
             provenance.requested_operation.as_deref(),
             Some("typed_subtree_crossover")
         );
-        assert!(provenance.parent_fingerprints.is_empty());
+        assert_eq!(provenance.parent_fingerprints, [] as [String; 0]);
         assert!(provenance.affected_path.is_none());
         assert_eq!(provenance.retry_count, RETRY_BUDGET);
     }

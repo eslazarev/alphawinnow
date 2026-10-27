@@ -200,7 +200,7 @@ fn search_writes_candidate_jsonl_and_adjacent_manifest_atomically() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect();
-    assert!(!lines.is_empty());
+    assert_ne!(lines, [] as [serde_json::Value; 0]);
     assert!(lines.iter().all(|record| record["schema"] == 4));
     assert!(lines.iter().all(|record| record["run_id"].is_string()));
     assert!(lines.iter().all(|record| {
@@ -810,7 +810,7 @@ fn search_uses_and_records_an_explicit_catalog() {
         String::from_utf8_lossy(&result.stderr)
     );
     let candidates = alphawinnow::read_candidates(&output).unwrap();
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates, [] as [alphawinnow::CandidateRecord; 0]);
     assert!(candidates.iter().all(|candidate| {
         alphawinnow::parse_expression_with_catalog(&candidate.expression, &catalog).is_ok()
             && candidate.expression.contains("custom_signal")
@@ -1221,7 +1221,10 @@ fn evaluate_reports_separate_causally_aligned_evidence() {
         evidence["overall"]["brain_proxy"]["remote_platform_result"],
         false
     );
-    assert!(!evidence["daily"].as_array().unwrap().is_empty());
+    assert_ne!(
+        evidence["daily"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     assert!(evidence["alignment"].as_str().unwrap().contains("t+1"));
 }
 
