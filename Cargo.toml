@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 # Parquet 60 supports the zstd 0.14 line containing the October 2026 fixes.
 parquet = { version = "60.0", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1"
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
 serde = { version = "1", features = ["derive"] }
 # Preserve finite f64 bits through JSON checkpoints and external outcomes.
