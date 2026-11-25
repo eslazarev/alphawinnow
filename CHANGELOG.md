@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `ask_with_report()` returns per-call rejection counts without changing proposal
+  generation. `diagnostics()` reports durable counters, remaining budgets, and
+  whether the session needs feedback or has exhausted a budget.
+- `screen_pending()` resolves an explicitly screened, entirely unevaluated batch.
+  It verifies exact pending identities and contexts, preserves measured parents,
+  and records no fabricated measurements. Proposal budgets are not refunded.
+- The JSONL example exposes `ask_with_report`, `diagnostics`, and `screen_pending`.
+  Existing operations and checkpoint formats remain unchanged.
+
 ## 0.3.0 — prepared, not yet published
 
 ### Fixed

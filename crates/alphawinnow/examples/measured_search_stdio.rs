@@ -35,6 +35,13 @@ enum Request {
         checkpoint: String,
     },
     Ask,
+    AskWithReport,
+    Diagnostics,
+    ScreenPending {
+        evaluator_context: String,
+        pool_context: String,
+        semantic_fingerprints: Vec<String>,
+    },
     Tell {
         evaluator_context: String,
         pool_context: String,
@@ -102,6 +109,20 @@ fn respond(
         request => {
             let session = session.as_mut().ok_or("initialize the session first")?;
             match request {
+                Request::AskWithReport => Ok(serde_json::to_value(session.ask_with_report()?)?),
+                Request::Diagnostics => Ok(serde_json::to_value(session.diagnostics())?),
+                Request::ScreenPending {
+                    evaluator_context,
+                    pool_context,
+                    semantic_fingerprints,
+                } => {
+                    session.screen_pending(
+                        &evaluator_context,
+                        &pool_context,
+                        &semantic_fingerprints,
+                    )?;
+                    Ok(json!({"screened": true, "diagnostics": session.diagnostics()}))
+                }
                 Request::Ask => Ok(
                     json!({"proposals": session.ask()?, "score_requests": session.score_requests(), "attempted": session.attempted(), "measured": session.measured()}),
                 ),
@@ -147,4 +168,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonl_screening_and_diagnostics_round_trip() {
+        let config: MeasuredSearchConfig = serde_json::from_str(include_str!(
+            "../../../examples/worldquant-brain/session-config.json"
+        ))
+        .unwrap();
+        let catalog = alphawinnow::builtin_catalog().clone();
+        let mut session = None;
+        respond(
+            &mut session,
+            Request::Init {
+                config: config.clone(),
+                catalog: catalog.clone(),
+            },
+        )
+        .unwrap();
+        let ask: Request = serde_json::from_str(r#"{"op":"ask_with_report"}"#).unwrap();
+        let report = respond(&mut session, ask).unwrap();
+        assert_eq!(report["schema"], 1);
+        assert_eq!(report["diagnostics"]["status"], "awaiting_feedback");
+        let proposals = report["proposals"].as_array().unwrap();
+        assert!(!proposals.is_empty());
+        let identities: Vec<_> = proposals
+            .iter()
+            .map(|p| p["semantic_fingerprint"].clone())
+            .collect();
+        let request = json!({"op":"screen_pending", "evaluator_context":config.evaluator_context,
+            "pool_context":"toy-pool", "semantic_fingerprints":identities});
+        let screened = respond(
+            &mut session,
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(screened["diagnostics"]["measured"], 0);
+        assert_eq!(screened["diagnostics"]["screened_out"], proposals.len());
+        assert!(respond(&mut session, serde_json::from_value(request).unwrap()).is_err());
+        let diagnostics = respond(
+            &mut session,
+            serde_json::from_str(r#"{"op":"diagnostics"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostics, screened["diagnostics"]);
+        let checkpoint = respond(&mut session, Request::Checkpoint).unwrap()["checkpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut restored = None;
+        respond(
+            &mut restored,
+            Request::Restore {
+                config,
+                catalog,
+                checkpoint,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            respond(&mut restored, Request::Diagnostics).unwrap(),
+            diagnostics
+        );
+        assert_eq!(
+            respond(&mut restored, Request::AskWithReport).unwrap(),
+            respond(&mut session, Request::AskWithReport).unwrap()
+        );
+    }
 }

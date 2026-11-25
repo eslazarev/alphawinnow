@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Catalog, ExprKind, Limits, Provenance, analyze_expression, canonical, crossover_with_catalog,
-    generate_with_catalog, mutate_applicable_with_catalog, mutate_with_catalog,
-    parse_expression_with_catalog, sample_with_catalog, semantic_fingerprint,
+    Catalog, Expr, ExprKind, Limits, Provenance, analyze_expression, canonical,
+    crossover_with_catalog, generate_with_catalog, mutate_applicable_with_catalog,
+    mutate_with_catalog, parse_expression_with_catalog, sample_with_catalog, semantic_fingerprint,
     validate_transformed_with_catalog,
 };
 
@@ -302,6 +302,58 @@ pub struct MeasuredOutcome {
     pub outcome: f64,
 }
 
+/// Current session state. Pending feedback takes precedence over exhausted budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredSearchStatus {
+    Ready,
+    AwaitingFeedback,
+    ProposalBudgetExhausted,
+    AttemptBudgetExhausted,
+    BothBudgetsExhausted,
+}
+
+/// Counters derived from durable session state, including after checkpoint restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredSearchDiagnostics {
+    pub schema: u32,
+    pub status: MeasuredSearchStatus,
+    pub attempted: u64,
+    /// Imported seeds are excluded.
+    pub emitted: usize,
+    pub measured: usize,
+    pub screened_out: usize,
+    pub imported: usize,
+    pub pending: usize,
+    pub remaining_proposals: usize,
+    pub remaining_attempts: u64,
+}
+
+/// Mutually exclusive outcomes of transforms attempted by one `ask_with_report` call.
+/// Persist this report externally for a per-call audit trail; it is not checkpoint state.
+/// Categories follow validation order: type, limits, analysis, history, then session dedup.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredAskCounters {
+    pub attempted: u64,
+    pub non_signal: u64,
+    pub invalid_transform: u64,
+    pub analysis_rejected: u64,
+    pub excluded_history: u64,
+    pub duplicate_seen: u64,
+    pub emitted: u64,
+}
+
+/// Proposals plus per-call accounting and durable totals. Retrying a pending batch
+/// returns the same proposals with zero per-call counters and `reused_pending = true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredAskReport {
+    pub schema: u32,
+    pub proposals: Vec<MeasuredProposal>,
+    pub reused_pending: bool,
+    pub counters: MeasuredAskCounters,
+    pub diagnostics: MeasuredSearchDiagnostics,
+}
+
 /// A caller-audited measurement in the session's exact evaluator context.
 /// These records initialize parents; they do not consume new-proposal budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -500,6 +552,45 @@ fn ensure(condition: bool, message: &str) -> Result<(), MeasuredSearchError> {
     }
 }
 
+fn propose_transform(
+    config: &MeasuredSearchConfig,
+    catalog: &Catalog,
+    parents: &[Expr],
+    index: u64,
+) -> (Expr, Provenance) {
+    let mut rng =
+        ChaCha8Rng::seed_from_u64(config.seed ^ index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    if parents.is_empty() || index.is_multiple_of(config.exploration_every) {
+        match config.exploration_policy {
+            MeasuredExploration::FixedCover => {
+                generate_with_catalog(config.seed, index, &config.limits, catalog)
+            }
+            MeasuredExploration::Grammar => {
+                sample_with_catalog(config.seed, index, &config.limits, catalog)
+            }
+        }
+    } else {
+        let left = rng.random_range(0..parents.len());
+        if parents.len() > 1 && rng.random_bool(0.5) {
+            let right = (left + rng.random_range(1..parents.len())) % parents.len();
+            crossover_with_catalog(
+                &parents[left],
+                &parents[right],
+                config.seed,
+                index,
+                &config.limits,
+                catalog,
+            )
+        } else {
+            let mutate = match config.mutation_policy {
+                MeasuredMutation::LegacyUniform => mutate_with_catalog,
+                MeasuredMutation::Applicable => mutate_applicable_with_catalog,
+            };
+            mutate(&parents[left], config.seed, index, &config.limits, catalog)
+        }
+    }
+}
+
 impl MeasuredSearchSession {
     /// Start an empty session with an explicit catalog and evaluation identity.
     ///
@@ -581,8 +672,25 @@ impl MeasuredSearchSession {
     /// # Errors
     /// Reports an internal parent parse failure without promoting a candidate.
     pub fn ask(&mut self) -> Result<Vec<MeasuredProposal>, MeasuredSearchError> {
+        Ok(self.ask_with_report()?.proposals)
+    }
+
+    /// Generate the same proposals as `ask`, with rejection counts for this call.
+    /// This does not change random streams, budgets, selection, or checkpoint schemas.
+    /// An exhausted attempt budget does not prove the formula space is exhausted.
+    ///
+    /// # Errors
+    /// Reports an internal parent parse failure without promoting a candidate.
+    pub fn ask_with_report(&mut self) -> Result<MeasuredAskReport, MeasuredSearchError> {
+        let mut counters = MeasuredAskCounters::default();
         if !self.state.pending.is_empty() {
-            return Ok(self.state.pending.clone());
+            return Ok(MeasuredAskReport {
+                schema: 1,
+                proposals: self.state.pending.clone(),
+                reused_pending: true,
+                counters,
+                diagnostics: self.diagnostics(),
+            });
         }
         let config = &self.state.config;
         let target = config
@@ -600,56 +708,34 @@ impl MeasuredSearchSession {
         while self.state.pending.len() < target && self.state.attempted < config.max_attempts {
             let index = self.state.attempted;
             self.state.attempted += 1;
-            let mut rng =
-                ChaCha8Rng::seed_from_u64(config.seed ^ index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            counters.attempted += 1;
             let (expression, provenance) =
-                if parents.is_empty() || index.is_multiple_of(config.exploration_every) {
-                    match config.exploration_policy {
-                        MeasuredExploration::FixedCover => {
-                            generate_with_catalog(config.seed, index, &config.limits, &self.catalog)
-                        }
-                        MeasuredExploration::Grammar => {
-                            sample_with_catalog(config.seed, index, &config.limits, &self.catalog)
-                        }
-                    }
-                } else {
-                    let left = rng.random_range(0..parents.len());
-                    if parents.len() > 1 && rng.random_bool(0.5) {
-                        let right = (left + rng.random_range(1..parents.len())) % parents.len();
-                        crossover_with_catalog(
-                            &parents[left],
-                            &parents[right],
-                            config.seed,
-                            index,
-                            &config.limits,
-                            &self.catalog,
-                        )
-                    } else {
-                        let mutate = match config.mutation_policy {
-                            MeasuredMutation::LegacyUniform => mutate_with_catalog,
-                            MeasuredMutation::Applicable => mutate_applicable_with_catalog,
-                        };
-                        mutate(
-                            &parents[left],
-                            config.seed,
-                            index,
-                            &config.limits,
-                            &self.catalog,
-                        )
-                    }
-                };
-            if expression.kind() != ExprKind::Signal
-                || validate_transformed_with_catalog(&expression, &config.limits, &self.catalog)
-                    .is_err()
-                || analyze_expression(&expression).rejection_reason.is_some()
+                propose_transform(config, &self.catalog, &parents, index);
+            if expression.kind() != ExprKind::Signal {
+                counters.non_signal += 1;
+                continue;
+            }
+            if validate_transformed_with_catalog(&expression, &config.limits, &self.catalog)
+                .is_err()
             {
+                counters.invalid_transform += 1;
+                continue;
+            }
+            if analyze_expression(&expression).rejection_reason.is_some() {
+                counters.analysis_rejected += 1;
                 continue;
             }
             let identity = semantic_fingerprint(&expression);
-            if self.state.excluded(&identity) || !self.state.seen.insert(identity.clone()) {
+            if self.state.excluded(&identity) {
+                counters.excluded_history += 1;
+                continue;
+            }
+            if !self.state.seen.insert(identity.clone()) {
+                counters.duplicate_seen += 1;
                 continue;
             }
             self.state.emitted += 1;
+            counters.emitted += 1;
             self.state.pending.push(MeasuredProposal {
                 ordinal: self.state.emitted,
                 expression: canonical(&expression),
@@ -657,7 +743,43 @@ impl MeasuredSearchSession {
                 provenance,
             });
         }
-        Ok(self.state.pending.clone())
+        Ok(MeasuredAskReport {
+            schema: 1,
+            proposals: self.state.pending.clone(),
+            reused_pending: false,
+            counters,
+            diagnostics: self.diagnostics(),
+        })
+    }
+
+    /// Inspect budgets and counters without generating proposals or changing state.
+    #[must_use]
+    pub fn diagnostics(&self) -> MeasuredSearchDiagnostics {
+        let emitted = self.state.emitted - self.state.imported();
+        let remaining_proposals = self.state.config.max_evaluations - emitted;
+        let remaining_attempts = self.state.config.max_attempts - self.state.attempted;
+        let status = if self.state.pending.is_empty() {
+            match (remaining_proposals == 0, remaining_attempts == 0) {
+                (false, false) => MeasuredSearchStatus::Ready,
+                (true, false) => MeasuredSearchStatus::ProposalBudgetExhausted,
+                (false, true) => MeasuredSearchStatus::AttemptBudgetExhausted,
+                (true, true) => MeasuredSearchStatus::BothBudgetsExhausted,
+            }
+        } else {
+            MeasuredSearchStatus::AwaitingFeedback
+        };
+        MeasuredSearchDiagnostics {
+            schema: 1,
+            status,
+            attempted: self.attempted(),
+            emitted,
+            measured: self.measured(),
+            screened_out: self.screened_out(),
+            imported: self.imported(),
+            pending: self.state.pending.len(),
+            remaining_proposals,
+            remaining_attempts,
+        }
     }
 
     /// Candidates that must receive a score in the next `tell` snapshot.
@@ -721,6 +843,70 @@ impl MeasuredSearchSession {
             "screened feedback requires a snapshot score policy",
         )?;
         self.apply_snapshot(evaluator_context, pool_context, outcomes, true)
+    }
+
+    /// Explicitly screen out an entire pending batch without any new measurements.
+    /// Supply its exact semantic fingerprints (order does not matter) to reject stale
+    /// requests. Parents, their scores, and semantic exclusions remain unchanged.
+    /// Existing parents require the same pool context; changing it requires rescoring.
+    /// Only snapshot score policies are supported, as with `tell_screened`.
+    ///
+    /// Use only for a deliberate screening decision before external evaluation.
+    /// Timeouts, missing results, and uncertain requests are not screening decisions.
+    /// Proposal/attempt budgets are not refunded. `measured()` does not increase.
+    ///
+    /// # Errors
+    /// Rejects unsupported policies, wrong contexts, an empty pending batch, and
+    /// missing, duplicate, stale, or unexpected fingerprints. Errors change no state.
+    pub fn screen_pending(
+        &mut self,
+        evaluator_context: &str,
+        pool_context: &str,
+        semantic_fingerprints: &[String],
+    ) -> Result<(), MeasuredSearchError> {
+        ensure(
+            self.state
+                .config
+                .parent_selection
+                .supports_screened_snapshot(),
+            "batch screening requires a snapshot score policy",
+        )?;
+        ensure(
+            evaluator_context == self.state.config.evaluator_context,
+            "evaluator context differs",
+        )?;
+        ensure(
+            !pool_context.trim().is_empty() && pool_context.len() <= 4096,
+            "pool context must be nonempty and bounded",
+        )?;
+        ensure(
+            self.state.parents.is_empty()
+                || self.state.pool_context.as_deref() == Some(pool_context),
+            "screening cannot change the retained parents' pool context",
+        )?;
+        ensure(
+            !self.state.pending.is_empty(),
+            "no pending measurement batch",
+        )?;
+        let expected: BTreeSet<_> = self
+            .state
+            .pending
+            .iter()
+            .map(|p| &p.semantic_fingerprint)
+            .collect();
+        let supplied: BTreeSet<_> = semantic_fingerprints.iter().collect();
+        ensure(
+            supplied.len() == semantic_fingerprints.len() && supplied == expected,
+            "screening requires the exact pending fingerprints",
+        )?;
+        self.state
+            .screened_out
+            .extend(self.state.pending.iter().map(|p| p.ordinal));
+        self.state.schema = BOOTSTRAPPED_SEARCH_SCHEMA;
+        self.state.measured += self.state.pending.len();
+        self.state.pending.clear();
+        self.state.pool_context = Some(pool_context.to_owned());
+        Ok(())
     }
 
     fn apply_snapshot(

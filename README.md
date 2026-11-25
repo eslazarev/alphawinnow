@@ -271,11 +271,33 @@ batch yields **8 measured + 24 screened**, not 32 measurements. The historical
 field name is retained for config compatibility; it is a **proposal budget**.
 Do not treat missing, timed-out or uncertain responses as screening decisions.
 
+If a selector rejects the entire batch before evaluation, use `screen_pending()`.
+Pass the evaluator context, pool context, and every pending semantic fingerprint.
+This explicit operation preserves parents and their scores without adding measurements.
+It rejects stale identities and changes to the retained parents' pool context.
+The proposals remain deduplicated and consume their original proposal budget.
+Only `Score` and `ScoreDiverseV1` support this operation.
+
+Use `ask_with_report()` when you need to explain low candidate yield.
+It returns the same proposals as `ask()`, plus mutually exclusive per-call counts:
+non-signal expressions, invalid transforms, analysis rejections, historical
+exclusions, session duplicates, and emitted proposals.
+Repeated pending requests return zero new counts and `reused_pending: true`.
+Persist these reports externally if you need an audit trail across restarts.
+The reports do not change checkpoint formats or random streams.
+
+`diagnostics()` reads durable totals without changing state.
+It distinguishes `ready`, `awaiting_feedback`, `proposal_budget_exhausted`,
+`attempt_budget_exhausted`, and `both_budgets_exhausted`.
+Pending feedback takes precedence, even when both remaining budgets are zero.
+An exhausted attempt budget does not prove that all possible formulas were searched.
+
 Warm starts and screened feedback support `Score` and `ScoreDiverseV1` policies.
 New measured winners can replace imported parents and drive the next batch.
 They use measured-search checkpoint schema 2; existing unbootstrapped,
 fully measured sessions retain schema 1 and their original serialization.
-The JSONL example exposes `init_measured` and `tell_screened` as well as the
+The JSONL example exposes `init_measured`, `tell_screened`, `screen_pending`,
+`ask_with_report`, and `diagnostics` as well as the
 existing operations. This is an offline integration API: it does not implement
 external simulation, submission, surrogate refitting, or a live-budget ledger.
 
