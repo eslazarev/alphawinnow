@@ -8,6 +8,10 @@
 - Raise the Arrow/Parquet minimum to 60.2 and update the lockfile to 60.2.0.
   This resolves Parquet advisory RUSTSEC-2026-0595 without enabling encryption
   or changing the configured Parquet features.
+- Record a temporary, owner-approved exception for Chrono maintenance notice
+  RUSTSEC-2026-0543, with a manual review deadline of December 31, 2026.
+  Other advisories remain checked. See `docs/dependency-exceptions.md` for scope
+  and removal steps.
 
 ### Added
 
