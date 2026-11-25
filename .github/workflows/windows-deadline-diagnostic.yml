@@ -1,0 +1,117 @@
+name: Windows deadline diagnostic
+
+# Temporary PR diagnostic. Remove after the timing failure is understood.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-deadline-diagnostic.yml
+      - crates/alphawinnow/src/engine.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-deadline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  deadline:
+    name: Windows deadline repeated trials
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-latest
+
+      - name: Build before measuring
+        run: cargo test --workspace --locked --all-features --lib --no-run
+
+      - name: Compare ten isolated and ten full-suite trials
+        shell: python
+        run: |
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import subprocess
+          import time
+
+          output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "deadline-diagnostic"
+          output.mkdir(parents=True, exist_ok=True)
+          base = ["cargo", "test", "--workspace", "--locked", "--all-features", "--lib"]
+          target = "engine::tests::deadline_is_a_hard_upper_bound_with_graceful_results"
+          metadata = {
+              "schema": 1,
+              "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "pr_head": os.environ["PR_HEAD_SHA"],
+              "platform": platform.platform(),
+              "cpu_count": os.cpu_count(),
+              "rustc": subprocess.check_output(["rustc", "--version", "--verbose"], text=True),
+              "test_threads": os.environ.get("RUST_TEST_THREADS", "default"),
+          }
+          (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          rows = []
+          # Alternate order to reduce systematic warm-up/order bias.
+          for trial in range(1, 11):
+              modes = ["isolated", "full-suite"] if trial % 2 else ["full-suite", "isolated"]
+              for mode in modes:
+                  command = base + ([target, "--", "--exact", "--nocapture"]
+                                    if mode == "isolated" else ["--", "--nocapture"])
+                  log = output / f"{trial:02d}-{mode}.log"
+                  started = time.monotonic()
+                  timed_out = False
+                  with log.open("w", encoding="utf-8") as handle:
+                      process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+                      try:
+                          code = process.wait(timeout=180)
+                      except subprocess.TimeoutExpired:
+                          timed_out = True
+                          subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
+                          process.wait(timeout=30)
+                          code = 124
+                  contents = log.read_text(encoding="utf-8", errors="replace")
+                  timing = re.search(r"deadline_diagnostic elapsed_seconds=([0-9.]+)", contents)
+                  passed = re.search(re.escape(target) + r" \.\.\. ok", contents) is not None
+                  row = {
+                      "schema": 1, "trial": trial, "mode": mode, "command": command,
+                      "exit_code": code, "timed_out": timed_out,
+                      "command_seconds": round(time.monotonic() - started, 6),
+                      "search_seconds": float(timing.group(1)) if timing else None,
+                      "deadline_test_passed": passed,
+                  }
+                  rows.append(row)
+                  with (output / "trials.jsonl").open("a", encoding="utf-8") as handle:
+                      handle.write(json.dumps(row) + "\n")
+                  print(json.dumps(row), flush=True)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Windows deadline diagnostic\n\n")
+              summary.write("Budget: 3 seconds. Allowed total: less than 5 seconds. No limits changed.\n\n")
+              summary.write("| Trial | Mode | Search seconds | Test passed | Exit code |\n")
+              summary.write("|---|---|---:|---|---:|\n")
+              for row in rows:
+                  summary.write(f"| {row['trial']} | {row['mode']} | {row['search_seconds']} | {row['deadline_test_passed']} | {row['exit_code']} |\n")
+          if any(row["exit_code"] != 0 or not row["deadline_test_passed"]
+                 or row["search_seconds"] is None for row in rows):
+              raise SystemExit(1)
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Keep logs even when a trial fails
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-deadline-diagnostic
+          path: ${{ runner.temp }}/deadline-diagnostic
+          retention-days: 7
+          if-no-files-found: warn

@@ -408,6 +408,23 @@ copy placeholder fingerprints. The protocol's sequence is:
 6. `checkpoint`: persist the returned checkpoint string. To restore, use a fresh
    process with `op: "restore"`, the identical config/catalog and that string.
 
+If the selector rejects every proposal before external evaluation, use
+`screen_pending` instead of `tell_screened`.
+Pass `evaluator_context`, `pool_context`, and `semantic_fingerprints` containing
+the exact identities returned by `ask`.
+The operation preserves measured parents and does not add measurement labels.
+With retained parents, the pool context must match their existing context.
+It supports only `Score` and `ScoreDiverseV1`, and does not refund proposal budget.
+Never use it to clear a timed-out or uncertain external request.
+
+For diagnostics, send `{"op":"diagnostics"}` without changing session state.
+Alternatively, `{"op":"ask_with_report"}` generates proposals with per-call
+rejection counts and durable budget totals.
+Its response contains `proposals`, `counters`, `reused_pending`, and `diagnostics`.
+Unlike `ask`, this response does not include `score_requests`.
+Request `ask` afterward to obtain them; the pending proposals remain unchanged.
+Persist per-call reports externally; they are not stored in checkpoints.
+
 Two literal protocol requests are:
 
 ```jsonl

@@ -2555,6 +2555,14 @@ mod tests {
         let started = Instant::now();
         let result = run_search(&bounded, None).unwrap();
         let elapsed = started.elapsed();
+        eprintln!(
+            "deadline_diagnostic elapsed_seconds={:.6} budget_seconds={} tolerance_seconds={} termination={} candidates={}",
+            elapsed.as_secs_f64(),
+            BUDGET.as_secs(),
+            TOLERATED_OVERSHOOT.as_secs(),
+            result.manifest.termination_reason,
+            result.candidates.len(),
+        );
         assert!(
             elapsed < BUDGET + TOLERATED_OVERSHOOT,
             "search took {elapsed:?}, overshooting the {BUDGET:?} deadline by more than {TOLERATED_OVERSHOOT:?}"

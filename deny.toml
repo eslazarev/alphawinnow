@@ -11,7 +11,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Temporary maintenance-risk exception. See docs/dependency-exceptions.md.
+# Review by 2026-12-31; this deadline is manual, not enforced by cargo-deny 0.20.2.
+# This does not suppress any other Chrono advisory or disable vulnerability checks.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "Chrono is required by Arrow/Parquet 60.2 and our optional Parquet reader; no patched version exists. Review by 2026-12-31 and remove after migration. See docs/dependency-exceptions.md." },
+]
 
 [licenses]
 version = 2
