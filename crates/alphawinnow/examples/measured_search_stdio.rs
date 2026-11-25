@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(report["schema"], 1);
         assert_eq!(report["diagnostics"]["status"], "awaiting_feedback");
         let proposals = report["proposals"].as_array().unwrap();
-        assert!(!proposals.is_empty());
+        assert_ne!(proposals.as_slice(), [] as [serde_json::Value; 0]);
         let identities: Vec<_> = proposals
             .iter()
             .map(|p| p["semantic_fingerprint"].clone())

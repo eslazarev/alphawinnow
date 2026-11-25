@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use alphawinnow::measured_search::{
     MeasuredAskCounters, MeasuredExploration, MeasuredMutation, MeasuredOutcome,
-    MeasuredParentSelection, MeasuredSearchConfig, MeasuredSearchSession, MeasuredSearchStatus,
-    MeasuredSeed,
+    MeasuredParentSelection, MeasuredProposal, MeasuredSearchConfig, MeasuredSearchSession,
+    MeasuredSearchStatus, MeasuredSeed,
 };
 use alphawinnow::{Limits, builtin_catalog};
 
@@ -95,7 +95,7 @@ fn reports_preserve_proposals_checkpoints_and_pending_retries() {
         score(&mut reported);
     }
     let report = reported.ask_with_report().unwrap();
-    assert!(report.proposals.is_empty());
+    assert_eq!(report.proposals, [] as [MeasuredProposal; 0]);
     assert_eq!(
         report.diagnostics.status,
         MeasuredSearchStatus::ProposalBudgetExhausted
@@ -122,7 +122,7 @@ fn all_screened_batches_resume_without_measurements_or_refunds() {
             .screen_pending(&cfg.evaluator_context, "pool-v1", &pending)
             .unwrap();
         assert_eq!(session.measured(), 0);
-        assert!(session.parents().is_empty());
+        assert_eq!(session.parents(), [] as [MeasuredProposal; 0]);
         assert!(
             session
                 .screen_pending(&cfg.evaluator_context, "pool-v1", &pending)
@@ -138,7 +138,7 @@ fn all_screened_batches_resume_without_measurements_or_refunds() {
         assert_eq!(restored.checkpoint_json().unwrap(), checkpoint);
         session = restored;
     }
-    assert!(session.ask().unwrap().is_empty());
+    assert_eq!(session.ask().unwrap(), [] as [MeasuredProposal; 0]);
     assert_eq!(session.screened_out(), 24);
     assert_eq!(session.diagnostics().remaining_proposals, 0);
 }
@@ -236,7 +236,7 @@ fn exclusions_explain_empty_batches_and_restore_referenced_history() {
     cfg.exploration_every = 1;
     let mut baseline = new(&cfg);
     let batch = baseline.ask().unwrap();
-    assert!(!batch.is_empty());
+    assert_ne!(batch, [] as [MeasuredProposal; 0]);
     let excluded = batch
         .iter()
         .map(|p| p.semantic_fingerprint.clone())
@@ -255,7 +255,7 @@ fn exclusions_explain_empty_batches_and_restore_referenced_history() {
     )
     .unwrap();
     let report = session.ask_with_report().unwrap();
-    assert!(report.proposals.is_empty());
+    assert_eq!(report.proposals, [] as [MeasuredProposal; 0]);
     assert!(report.counters.excluded_history > 0);
     assert_eq!(
         report.diagnostics.status,

@@ -12,11 +12,11 @@ homepage = "https://github.com/eslazarev/alphawinnow"
 
 [workspace.dependencies]
 anyhow = "1"
-arrow-array = "60.0"
+arrow-array = "60.2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
-# Parquet 60 supports the zstd 0.14 line containing the October 2026 fixes.
-parquet = { version = "60.0", default-features = false, features = ["arrow", "zstd"] }
+# Parquet 60.2 fixes RUSTSEC-2026-0595 and retains the patched zstd 0.14 line.
+parquet = { version = "60.2", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1"
 rand = "0.9"
 rand_chacha = "0.9"

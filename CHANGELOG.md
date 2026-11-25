@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Use explicit collection comparisons in the new tests for current Clippy rules.
+- Raise the Arrow/Parquet minimum to 60.2 and update the lockfile to 60.2.0.
+  This resolves Parquet advisory RUSTSEC-2026-0595 without enabling encryption
+  or changing the configured Parquet features.
+
 ### Added
 
 - `ask_with_report()` returns per-call rejection counts without changing proposal
