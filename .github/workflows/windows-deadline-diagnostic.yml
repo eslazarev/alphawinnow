@@ -109,7 +109,7 @@ jobs:
 
       - name: Keep logs even when a trial fails
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: windows-deadline-diagnostic
           path: ${{ runner.temp }}/deadline-diagnostic
