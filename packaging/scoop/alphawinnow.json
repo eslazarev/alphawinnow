@@ -1,13 +1,13 @@
 {
-    "version": "0.3.3",
+    "version": "0.3.4",
     "description": "Typed, deterministic formulaic alpha-mining and factor-evaluation engine",
     "homepage": "https://github.com/eslazarev/alphawinnow",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/eslazarev/alphawinnow/releases/download/v0.3.3/alphawinnow-0.3.3-x86_64-pc-windows-msvc.zip",
-            "hash": "51463187e30747fa4973da89a1410bfdb9f265f36a9fcedfe71d697efeadea3e",
-            "extract_dir": "alphawinnow-0.3.3-x86_64-pc-windows-msvc"
+            "url": "https://github.com/eslazarev/alphawinnow/releases/download/v0.3.4/alphawinnow-0.3.4-x86_64-pc-windows-msvc.zip",
+            "hash": "c3a1f09e5361d8111230233db1e65b495ac1376952a3d917145293ba14283eb8",
+            "extract_dir": "alphawinnow-0.3.4-x86_64-pc-windows-msvc"
         }
     },
     "bin": "alphawinnow.exe",
